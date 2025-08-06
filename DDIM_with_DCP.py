@@ -292,6 +292,7 @@ def build_mask_predictor():
 
 # ─── 8) Sinus Embedding & U‑Net 블록 ───
 @tf.keras.utils.register_keras_serializable(package='ddpm')
+# 입력이 (B,1,1,1)일때 (B,1,1,zdim)으로 출력
 def sinusoidal_embedding(x):    # 위치 임베딩처럼, 각 스텝 t를 여러 주파수의 사인, 코사인 함수로 변환함.
     freqs = tf.exp(tf.linspace(tf.math.log(1.0),
                                tf.math.log(embed_max_freq),
@@ -299,31 +300,31 @@ def sinusoidal_embedding(x):    # 위치 임베딩처럼, 각 스텝 t를 여러
     ang   = 2*math.pi*freqs
     return tf.concat([tf.sin(ang*x), tf.cos(ang*x)], axis=3)
 
-def ResidualBlock(w):
+def ResidualBlock(w):   # 입력 : (B, sz, sz, C)
     def f(x):
-        res = x if x.shape[-1]==w else layers.Conv2D(w,1)(x)
-        y   = layers.BatchNormalization(center=False,scale=False)(x)
-        y   = layers.Conv2D(w,3,padding='same',activation='swish')(y)
-        y   = layers.Conv2D(w,3,padding='same')(y)
-        return layers.Add()([y,res])
+        res = x if x.shape[-1]==w else layers.Conv2D(w,kernel_size = 1)(x)    # (B, sz, sz, w[?]) -> x의 채널의 변환시킴
+        y   = layers.BatchNormalization(center=False,scale=False)(x)    # (B, sz, sz, w[?])
+        y   = layers.Conv2D(w,kernel_size = 3,padding='same',activation='swish')(y) # (B, sz, sz, w[?])
+        y   = layers.Conv2D(w,kernel_size = 3,padding='same')(y)    # (B, sz, sz, w[?])
+        return layers.Add()([y,res])    # 출력 : (B, sz, sz, w[?])
     return f
 
-def DownBlock(w,bd):
+def DownBlock(w,bd):    # 입력 : (B, sz, sz, C)
     def f(xs):
         x,sk = xs
         for _ in range(bd):
-            x = ResidualBlock(w)(x); sk.append(x)
-        return layers.AveragePooling2D(2)(x)
+            x = ResidualBlock(w)(x); sk.append(x)   # bottleneck 직전 : (B, sz, sz, w[2]) 여기서는 w[2] = 768
+        return layers.AveragePooling2D(2)(x)    # for문 끝나고의 출력 : (B, sz / 2, sz / 2, w[2])
     return f
 
-def UpBlock(w,bd):
+def UpBlock(w,bd):  # 입력 : (B, sz / 2, sz / 2, C) -> 여기서는 C = w[3] = 768이 들어옴
     def f(xs):
         x,sk = xs
-        x = layers.UpSampling2D(2,interpolation='bilinear')(x)
+        x = layers.UpSampling2D(2,interpolation='bilinear')(x)     # (B, sz, sz, w[3])
         for _ in range(bd):
-            x = layers.Concatenate()([x,sk.pop()])
-            x = ResidualBlock(w)(x)
-        return x
+            x = layers.Concatenate()([x,sk.pop()])  # (B, sz, sz, w[2] + w[2])
+            x = ResidualBlock(w)(x) # (B, sz, sz, w[2])
+        return x    # for문 끝나고의 출력 : (B, sz, sz, w[0])
     return f
 
 
@@ -399,25 +400,26 @@ def get_network_conditional_mask(sz, ws, bd, ctx_dim):
     mask_in = keras.Input((sz,sz,1), name='mask')
 
     e = layers.Lambda(sinusoidal_embedding)(tstep)  # 서로 다른 빈도로 변하는 사인,코사인 값들이 합쳐져, network가 몇 번째 스텝인지 구분하기 쉬워짐
-    e = layers.UpSampling2D(sz, interpolation='nearest')(e)
-    e = layers.Conv2D(ws[0], kernel_size=1, activation='swish')(e)  # 추가
+    e = layers.UpSampling2D(sz, interpolation='nearest')(e) #(B,sz,sz,zdim) 여기서는 zdim = 32
     
-    x = layers.Concatenate()([noised,hazy,e])
-    x = layers.Conv2D(ws[0],kernel_size=1)(x)
+    x = layers.Concatenate()([noised,hazy]) # (B,sz,sz,6)
+    x = layers.Conv2D(ws[0],kernel_size=1)(x)   #(B, sz, sz, w[0])
+    x = layers.Concatenate()([x, e])        # (B,sz,sz, w[0] + zdim) 여기서 zdim = 32
     sk = []
+    
     # Down: Residual only
-    for w in ws[:-1]:
-        x = DownBlock(w, bd)([x, sk])
+    for w in ws[:-1]:   # 입력 (B, sz, sz, w[0])
+        x = DownBlock(w, bd)([x, sk])   
 
     for _ in range(bd):
-        x = ResidualBlock(ws[-1])(x)
+        x = ResidualBlock(ws[-1])(x)  # for문 이후의 텐서 : (B, sz / 2, sz / 2, w[2])
     #x = CrossAttentionBlock(ws[-1])([x, context])
 
     # Up: Residual only
     for w in reversed(ws[:-1]):
-        x = UpBlock(w, bd)([x, sk])
+        x = UpBlock(w, bd)([x, sk]) # 출력 (B, sz, sz, w[0])
 
-    out = layers.Conv2D(3, 1, activation='linear', kernel_initializer= 'he_normal')(x)       # 예측된 노이즈를 담고 있는 텐서 출력 (B, sz,sz, 3)
+    out = layers.Conv2D(3, 1, activation='linear', kernel_initializer= 'he_normal')(x)     # 예측된 노이즈를 담고 있는 텐서 출력 (B, sz,sz, 3)
     return keras.Model([noised, hazy, tstep, context, mask_in], out) # out = 𝜖^𝜃
 
 
@@ -463,11 +465,11 @@ class DiffusionModel(keras.Model):
     #     # 3) 그 각도의 사인·코사인 값을 그대로 노이즈 비율(nr)과
     #     #  신호 비율(sr)로 반환합니다
     #     return tf.sin(ang), tf.cos(ang) #sin이 노이즈비율 , cos이 신호비율
-    def diffusion_schedule(self, t, s=0.008):
+    def diffusion_schedule(self, t, s=0.008):   # normalized cosine scheduler
         ft = tf.cos((t + s) / (1 + s) * math.pi / 2) ** 2
-        alpha_bar = ft  # normalize 안 하고 그대로 사용하거나,
-        # alpha_bar = ft / tf.reduce_max(ft)  # 이 방식도 가능
-        alpha_bar = tf.clip_by_value(alpha_bar, 1e-4, 0.999)
+        #alpha_bar = ft  # normalize 안 하고 그대로 사용하거나,
+        alpha_bar = ft / tf.reduce_max(ft)  # 정규화를 통해 최댓값이 1.0이 되도록 하는 방식도 가능
+        alpha_bar = tf.clip_by_value(alpha_bar, min_signal_rate, max_signal_rate)
         sr = tf.sqrt(alpha_bar)
         nr = tf.sqrt(1.0 - alpha_bar)
         return nr, sr
@@ -523,17 +525,15 @@ class DiffusionModel(keras.Model):
             #     pred_x0 = pred_x0
             
             tf.print("pred shape:", tf.shape(pred), "min/max:", tf.reduce_min(pred), "/", tf.reduce_max(pred))            
-            
-            #loss = 0.1 * self.loss_fn(pred, noise) + 0.9 * self.loss_fn(pred_x0, clear_n) # 1.0과 0.0이면 noise-only학습, 0.0과 1.0이면 x0-only 학습
-            
-            # epoch에 따라 w_noise 증감
-            r = epoch / num_epochs
-            w_noise = 0.7 * (1 - r) + 0.2 * r  # 학습 초반엔 noise 중심 → 후반엔 x0 중심
-            w_x0    = 1 - w_noise
-            loss = w_noise * self.loss_fn(pred, noise) \
-                + w_x0    * self.loss_fn(pred_x0, clear_n)
-
-            tf.print("pred_x0 mean/std:", tf.reduce_mean(pred_x0), "/", tf.math.reduce_std(pred_x0))
+                        
+            # # epoch에 따라 w_noise 증감
+            # r = epoch / num_epochs
+            # w_noise = 0.7 * (1 - r) + 0.2 * r  # 학습 초반엔 noise 중심 → 후반엔 x0 중심
+            # w_x0    = 1 - w_noise
+            # loss = w_noise * self.loss_fn(pred, noise) \
+            #     + w_x0    * self.loss_fn(pred_x0, clear_n)
+            loss = self.loss_fn(pred, noise)
+            tf.print("pred_x0 mean/std:", tf.reduce_mean(pred_x0), "/", tf.math.reduce_std(pred_x0))    # pred_mean = -0.05 ~ 0.05, pred_std = 0.4 ~ 0.6이면 정상 범위
             tf.print("clear_n mean/std:", tf.reduce_mean(clear_n), "/", tf.math.reduce_std(clear_n))
 
         grads = tape.gradient(loss, self.network.trainable_weights)
@@ -572,9 +572,6 @@ class DiffusionModel(keras.Model):
 
         noise = tf.random.normal((tf.shape(hazy_n)[0], img_siz, img_siz, 3))
         next_x = noise
-        # T_time = tf.fill([tf.shape(hazy_n)[0], 1, 1, 1], 1.0)
-        # nr, sr = self.diffusion_schedule(T_time)
-        # next_x = sr * next_x + nr * noise
         mask = self.mask_pred(hazy_imgs, training=False)
         for i in reversed(range(steps)):
 
@@ -597,8 +594,7 @@ class DiffusionModel(keras.Model):
             px0 = px0_raw
 
             # 4) 디버깅용 출력 (분포 확인)
-            tf.print("px0_raw min/max:", tf.reduce_min(px0_raw), "/", tf.reduce_max(px0_raw))   # tf.tanh 적용시키기 전
-            tf.print("px0      min/max:", tf.reduce_min(px0),    "/", tf.reduce_max(px0))       # tf.tanh 적용시키고 난 후
+            tf.print("clippingX px0 min/max:", tf.reduce_min(px0_raw), "/", tf.reduce_max(px0_raw))   # tf.tanh 적용시키기 전
 
             # 5) 다음 스텝으로 업데이트
             next_t = t - 1.0 / steps
@@ -667,6 +663,22 @@ dummy_ctx   = tf.zeros((1, seq_len, ctx_dim), dtype=tf.float32)
 dummy_mask  = tf.zeros((1, img_siz, img_siz, 1), dtype=tf.float32)
 
 _ = model([dummy_hazy, dummy_hazy, dummy_t, dummy_ctx, dummy_mask], training=False)
+
+
+#GT data set의 평균과 표준편차 확인---------------
+mean_accum = tf.Variable(tf.zeros([3], dtype=tf.float32))
+std_accum  = tf.Variable(tf.zeros([3], dtype=tf.float32))
+n = 0
+
+for _, gt, *_ in train_ds.take(6000):  # 🔁 두 번째 요소 = clear image
+    tf.print("GT min:", tf.reduce_min(gt), "max:", tf.reduce_max(gt))  # [0,1] 또는 [-1,1] 확인
+    gt = tf.reshape(gt, [-1, 3])
+    mean_accum.assign_add(tf.reduce_mean(gt, axis=0))
+    std_accum.assign_add(tf.math.reduce_std(gt, axis=0))
+    n += 1
+
+tf.print("📊 GT mean:", mean_accum / n)
+tf.print("📊 GT std :", std_accum / n)
 
 
 # ─── 13) 학습 설정 & 실행 ───
