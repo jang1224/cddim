@@ -17,9 +17,11 @@ import cv2
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+
 import tensorflow as tf
 from tensorflow import keras
-from keras import layers
+from tensorflow.keras import layers, optimizers
+
 from pathlib import Path
 from transformers import BlipProcessor, BlipForConditionalGeneration, BlipTextModel, BartConfig, TFBartForConditionalGeneration
 from transformers.models.bart.modeling_tf_bart import TFBartAttention
@@ -33,33 +35,42 @@ from datasets import load_dataset
 np.random.seed(None)
 tf.random.set_seed(None)
 
-print("GPU available:", tf.config.list_physical_devices('GPU'))
+gpus = tf.config.list_physical_devices('GPU')
+print("GPU available:", gpus)
+for g in gpus:
+    tf.config.experimental.set_memory_growth(g, True) #-> gpu사용량 줄이려고
 
 
 # ─── 3) 하이퍼파라미터 ───
 img_siz             = 64
 batch_siz           = 8
-kid_diffusion_steps = 100    # ← must be before class definition
-min_signal_rate     = 0.02
-max_signal_rate     = 0.95
-zdim                = 32
+gradient_accumulation_steps = 4
+effective_batch_siz = batch_siz * gradient_accumulation_steps
+kid_diffusion_steps = 50    # ← must be before class definition
+min_signal_rate     = 1e-4 #0.02
+max_signal_rate     = 0.95 #0.95
+zdim                = 64
 embed_max_freq      = 1000.0
-widths              = [160,320,768,768] # 768인 이유는 bottleneck 채널수와 crossattention(BART)의 d_model = 768로 같아야 가중치 로드가 에러 없이 됨.
+widths              = [64, 128, 256, 512]#[160,320,768,768] # 768인 이유는 bottleneck 채널수와 crossattention(BART)의 d_model = 768로 같아야 가중치 로드가 에러 없이 됨.
 block_depth         = 2
-ctx_dim             = 768   # CLIP ViT-L/14
+ctx_dim             = 512   
 seq_len             = 77    # tokenizer max length
-num_epochs          = 50    # 학습 에폭
+num_epochs          = 100    # 학습 에폭
+
 
 # 모델 준비
 processor_blip = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
 model_blip     = BlipForConditionalGeneration.from_pretrained(
                 "Salesforce/blip-image-captioning-base"
-            ).cuda().eval()
+            ).to("cpu").eval()  #.to("cuda") -> gpu사용량 줄이려고
+
+model_blip.trainable = False  #  꼭 이 줄 필요함!-> tf.keras.model을 쓰는데 blip의 tf-keras가 간섭을 일으킴. 그래서 학습 제거.
+
 #텍스트를 임베딩하는 모델
 txt_processor_blip = processor_blip.tokenizer  # BLIPProcessor 안에 tokenizer
 txt_model_blip     = BlipTextModel.from_pretrained(
                     "Salesforce/blip-image-captioning-base"
-                ).cuda().eval()
+                ).to("cpu").eval()  #.to("cuda") -> gpu사용량 줄이려고
 
 
 # ——— 1) 데이터 경로 설정 ———
@@ -85,7 +96,8 @@ exts     = ('.png', '.jpg', '.jpeg')
 #         caption = processor_blip.decode(out[0], skip_special_tokens=True)
 
 #     context_dict[str(img_path)] = caption
-#     print(f"{img_path.name} → {caption}")
+#     if tf.executing_eagerly():
+#       tf.print(f"{img_path.name} → {caption}")
 
 # # JSON 저장
 # # Google Drive 등 원하는 경로에 저장
@@ -94,7 +106,8 @@ exts     = ('.png', '.jpg', '.jpeg')
 # with open(output_json, "w") as f:
 #     json.dump(context_dict, f, indent=2)
 
-# print(f"context 저장 완료 : {output_json}")
+# if tf.executing_eagerly():
+#    tf.print(f"context 저장 완료 : {output_json}")
 
 json_path = "/home/jang/DDIM_python/paper/reside6k_contexts_blip.json"
 with open(json_path, "r") as f:
@@ -128,7 +141,7 @@ def encode_context(text_str: str) -> np.ndarray:
         [text_str],
         padding="max_length", truncation=True, max_length=seq_len,
         return_tensors="pt"
-    ).to("cuda")
+    )   #.to("cuda") -> gpu사용량 줄이려고
 
     with torch.no_grad():
         outputs = txt_model_blip(**inputs)
@@ -154,44 +167,41 @@ def encode_context(text_str: str) -> np.ndarray:
     
 context_embedding_dir = '/home/jang/DDIM_python/paper/contexts_blip_embedding'
     
-def load_pair_train(h_path, r_path, _):  # dummy 세 번째 인자
-    hazy  = tf.image.decode_jpeg(tf.io.read_file(h_path), channels=3)
-    clear = tf.image.decode_jpeg(tf.io.read_file(r_path), channels=3)
-    hazy  = tf.image.resize(hazy,  [img_siz,img_siz])
-    clear = tf.image.resize(clear,[img_siz,img_siz])
-    hazy  = tf.cast(hazy, tf.float32) / 255.0
-    clear = tf.cast(clear, tf.float32) / 255.0
+def _read_image(path):  
+    img = tf.io.decode_image(tf.io.read_file(path), channels=3, expand_animations=False)
+    img.set_shape([None, None, 3])
+    return tf.image.convert_image_dtype(img, tf.float32)    # 여기서 /255.0 해줌
 
-    stem     = tf.strings.split(h_path, os.sep)[-1]
-    npy_name = tf.strings.regex_replace(stem, ".jpg", ".npy")
-    ctx_path = tf.strings.join([context_embedding_dir, "/", npy_name])
+def load_pair_train(h_path, r_path, _):  # dummy 세 번째 인자
+    hazy  = tf.image.resize(_read_image(h_path),  [img_siz, img_siz])
+    clear = tf.image.resize(_read_image(r_path), [img_siz, img_siz])
+
+    stem = tf.strings.regex_replace(tf.strings.split(h_path, os.sep)[-1], r"\.(jpg|jpeg|png)$", "")
+    ctx_path = tf.strings.join([context_embedding_dir, "/", stem, ".npy"])
 
     def _load_context(path_bytes):
         return np.load(path_bytes.decode("utf-8")).astype(np.float32)
 
-    ctx = tf.numpy_function(_load_context, [ctx_path], tf.float32)
-    ctx.set_shape([seq_len, ctx_dim])
+    ctx = tf.numpy_function(_load_context, [ctx_path], tf.float32)  # 파일에서 직접 읽은 데이터의 실제 크기는 (77,768)
+    ctx.set_shape([seq_len, 768])
     return hazy, clear, ctx
 
 
 def load_pair_test(h_path, r_path, _):
-    hazy  = tf.image.decode_jpeg(tf.io.read_file(h_path), channels=3)
-    clear = tf.image.decode_jpeg(tf.io.read_file(r_path), channels=3)
-    hazy  = tf.image.resize(hazy,  [img_siz,img_siz])
-    clear = tf.image.resize(clear,[img_siz,img_siz])
-    hazy  = tf.cast(hazy, tf.float32) / 255.0
-    clear = tf.cast(clear, tf.float32) / 255.0
+    hazy  = tf.image.resize(_read_image(h_path),  [img_siz, img_siz])
+    clear = tf.image.resize(_read_image(r_path), [img_siz, img_siz])
+
 
     def _generate_context(h_path_bytes):
         path = h_path_bytes.numpy().decode("utf-8")
         img  = Image.open(path).convert("RGB")
-        inp  = processor_blip(img, return_tensors="pt").to("cuda")
+        inp  = processor_blip(img, return_tensors="pt") #.to("cuda") -> gpu 사용량 줄이려고
         out  = model_blip.generate(**inp, max_length=50)
         cap  = processor_blip.decode(out[0], skip_special_tokens=True)
         return encode_context(cap)
 
     ctx = tf.py_function(_generate_context, [h_path], tf.float32)
-    ctx.set_shape([seq_len, ctx_dim])
+    ctx.set_shape([seq_len, 768])
     return hazy, clear, ctx
 
 
@@ -207,88 +217,55 @@ train_ds = (
     .take(total_count)
     .map(load_pair_train, num_parallel_calls=tf.data.AUTOTUNE)
     .repeat()
-    .shuffle(batch_siz)
+    .shuffle(1024)
     .batch(batch_siz)
     .prefetch(tf.data.AUTOTUNE)
 )
 
 val_ds = (
     ds_test
-    .map(load_pair_test, num_parallel_calls=tf.data.AUTOTUNE)
+    .map(load_pair_test, num_parallel_calls=1)
     .repeat()
     .cache()
     .batch(batch_siz)
     .prefetch(tf.data.AUTOTUNE)
 )
 
+steps_per_epoch = int(tf.math.ceil(len(hazy_files) / batch_siz)) # 6000 / batch_siz
+val_steps = kid_diffusion_steps #len(hazy_test_files)//batch_siz
 
-# ─── 7) Dark Channel Prior 기반 마스크 예측 함수 정의 ───
-def DarkChannel(im, sz):
-    b,g,r = cv2.split(im)
-    dc = cv2.min(cv2.min(r,g),b)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT,(sz,sz))
-    return cv2.erode(dc, kernel)
 
-def AtmLight(im, dark):
-    h,w = im.shape[:2]
-    imsz = h*w
-    numpx = max(imsz//1000, 1)
-    darkvec = dark.reshape(imsz)
-    imvec = im.reshape(imsz,3)
-    indices = np.argsort(darkvec)[-numpx:]
-    return np.mean(imvec[indices], axis=0, keepdims=True)
+# TensorFlow 버전의 Dark Channel
+def tf_dark_channel(img, patch_size=15):
+    min_rgb = tf.reduce_min(img, axis=-1, keepdims=True)  # (B, H, W, 1)
+    return -tf.nn.max_pool2d(-min_rgb, ksize=patch_size, strides=1, padding='SAME')
 
-def TransmissionEstimate(im, A, sz):
-    omega = 0.95
-    im3 = np.empty(im.shape, im.dtype)
-    for i in range(3):
-        im3[:,:,i] = im[:,:,i]/A[0,i]
-    return 1 - omega * DarkChannel(im3, sz)
+# Transmission map 추정
+def tf_transmission_estimate(img, airlight, patch_size=15, omega=0.95):
+    img_norm = img / (airlight + 1e-6)
+    dark = tf_dark_channel(img_norm, patch_size)
+    return 1 - omega * dark  # (B, H, W, 1)
 
-def Guidedfilter_gray(im, p, r=60, eps=1e-4):
-    mean_I  = cv2.boxFilter(im,cv2.CV_64F,(r,r))
-    mean_p  = cv2.boxFilter(p, cv2.CV_64F,(r,r))
-    cov_Ip  = cv2.boxFilter(im*p,cv2.CV_64F,(r,r)) - mean_I*mean_p
-    var_I   = cv2.boxFilter(im*im,cv2.CV_64F,(r,r)) - mean_I*mean_I
-    a       = cov_Ip/(var_I+eps)
-    b       = mean_p - a*mean_I
-    return cv2.boxFilter(a,cv2.CV_64F,(r,r))*im + cv2.boxFilter(b,cv2.CV_64F,(r,r))
+# 간단한 guided filter (box smoothing)
+def tf_box_filter(img, r=15):   # 64x64 이미지에 40x40 필터는 너무 큼
+    return tf.nn.avg_pool2d(img, ksize=r, strides=1, padding='SAME')
 
-def TransmissionRefine(im, et):
-    gray = cv2.cvtColor((im*255).astype(np.uint8), cv2.COLOR_BGR2GRAY).astype(np.float64)/255
-    return Guidedfilter_gray(gray, et)
+# 입력 이미지를 grayscale로 변환 후 guided filter 수행 -> 트랜스미션 맵을 더 자연스럽고 세밀하게 정제하기 위해서
+def tf_transmission_refine(img, est_trans):
+    gray = tf.image.rgb_to_grayscale(img)
+    return tf_box_filter(est_trans * gray)
 
-def estimate_transmission(src):
-    I = src.astype('float64')/255
-    dark = DarkChannel(I,15)
-    A    = AtmLight(I,dark)
-    te   = TransmissionEstimate(I,A,15)
-    t    = TransmissionRefine((src*255).astype(np.uint8), te)
-    return np.clip(t.astype(np.float32),0.0,1.0)
-
-def estimate_transmission_batch(batch_np: np.ndarray) -> np.ndarray:
-    masks = []
-    for im in batch_np:
-        t = estimate_transmission((im*255).astype(np.uint8))
-        masks.append(t[...,None])
-    return np.stack(masks, axis=0)  # (B,H,W,1)
-
+# 최종 마스크 예측 모델
 def build_mask_predictor():
     inp = keras.Input((img_siz, img_siz, 3), dtype=tf.float32)
 
-    mask = layers.Lambda(
-        lambda batch: tf.ensure_shape(
-            tf.numpy_function(
-                func=estimate_transmission_batch,
-                inp=[batch],
-                Tout=tf.float32
-            ),
-            [None, img_siz, img_siz, 1]   # 배치는 None, H/W/1은 고정
-        ),
-        output_shape=(img_siz, img_siz, 1)  # Keras에도 알리기
-    )(inp)
+    # Airlight 추정 (평균값 사용: trainable하지 않음)
+    airlight = layers.Lambda(lambda x: tf.reduce_max(x, axis=[1, 2], keepdims=True))(inp)  # (B, 1, 1, 3)
 
-    return keras.Model(inputs=inp, outputs=mask, name='mask_predictor')
+    t_est = layers.Lambda(lambda x: tf_transmission_estimate(x[0], x[1]))([inp, airlight])
+    t_ref = layers.Lambda(lambda x: tf_transmission_refine(x[0], x[1]))([inp, t_est])
+
+    return keras.Model(inputs=inp, outputs=t_ref, name='mask_predictor')
 
 # ─── 8) Sinus Embedding & U‑Net 블록 ───
 @tf.keras.utils.register_keras_serializable(package='ddpm')
@@ -300,132 +277,249 @@ def sinusoidal_embedding(x):    # 위치 임베딩처럼, 각 스텝 t를 여러
     ang   = 2*math.pi*freqs
     return tf.concat([tf.sin(ang*x), tf.cos(ang*x)], axis=3)
 
-def ResidualBlock(w):   # 입력 : (B, sz, sz, C)
-    def f(x):
-        res = x if x.shape[-1]==w else layers.Conv2D(w,kernel_size = 1)(x)    # (B, sz, sz, w[?]) -> x의 채널의 변환시킴
-        y   = layers.BatchNormalization(center=False,scale=False)(x)    # (B, sz, sz, w[?])
-        y   = layers.Conv2D(w,kernel_size = 3,padding='same',activation='swish')(y) # (B, sz, sz, w[?])
-        y   = layers.Conv2D(w,kernel_size = 3,padding='same')(y)    # (B, sz, sz, w[?])
-        return layers.Add()([y,res])    # 출력 : (B, sz, sz, w[?])
-    return f
-
-def DownBlock(w,bd):    # 입력 : (B, sz, sz, C)
-    def f(xs):
-        x,sk = xs
-        for _ in range(bd):
-            x = ResidualBlock(w)(x); sk.append(x)   # bottleneck 직전 : (B, sz, sz, w[2]) 여기서는 w[2] = 768
-        return layers.AveragePooling2D(2)(x)    # for문 끝나고의 출력 : (B, sz / 2, sz / 2, w[2])
-    return f
-
-def UpBlock(w,bd):  # 입력 : (B, sz / 2, sz / 2, C) -> 여기서는 C = w[3] = 768이 들어옴
-    def f(xs):
-        x,sk = xs
-        x = layers.UpSampling2D(2,interpolation='bilinear')(x)     # (B, sz, sz, w[3])
-        for _ in range(bd):
-            x = layers.Concatenate()([x,sk.pop()])  # (B, sz, sz, w[2] + w[2])
-            x = ResidualBlock(w)(x) # (B, sz, sz, w[2])
-        return x    # for문 끝나고의 출력 : (B, sz, sz, w[0])
-    return f
-
-
-# 사전학습된 attnetion 불러옴.
-class CrossAttentionBlock(layers.Layer):
-    #layer_idx는 층의 인덱스를 나타내는데 BART는 총 attnetion이 6개가 있음. -> 인덱스가 커질수록 low level에서 high level의 의미 정보를 담고 있음
-    def __init__(self, channels, hf_model="facebook/bart-base", layer_idx=0, **kwargs):
+class ResidualBlock(layers.Layer):  # 입력 : (B, sz, sz, C)
+    def __init__(self, w, **kwargs):
         super().__init__(**kwargs)
-        # BART config: cross-attention 활성화
-        # Config 로드
-        config = BartConfig.from_pretrained(hf_model, add_cross_attention=True)
-        self.d_model   = config.d_model                    # e.g. 768
-        self.n_heads   = config.decoder_attention_heads    # e.g. 12
-        self.attn_drop = config.attention_dropout          # 일반적으로 0.0~0.1
-        # CrossAttentionBlock __init__에서 추가
-        self.trainable = True             # 전체 Layer도 설정
+        self.proj = layers.Conv2D(w, 1)  # 필요 시
+        self.norm = layers.BatchNormalization(center=False,scale=False)
+        self.conv1 = layers.Conv2D(w, kernel_size = 3, padding='same', kernel_initializer='he_normal',activation='swish')
+        self.conv2 = layers.Conv2D(w, kernel_size = 3, padding='same', kernel_initializer='he_normal')
+        self.w = w
+    def get_config(self):
+        cfg = super().get_config(); cfg.update({"w": self.w}); return cfg
+        
+    @classmethod
+    def from_config(cls, cfg):
+        return cls(**cfg)
+    
+    def call(self, x, training=None):
+        res = x if x.shape[-1] == self.conv2.filters else self.proj(x)  # (B, sz, sz, w[?]) -> x의 채널의 변환시킴
+        y = self.norm(x, training=training)
+        y = self.conv1(y)
+        y = self.conv2(y)
+        return res + y   # 출력 : (B, sz, sz, w[?])
+    
+class DownBlock(layers.Layer):  
+    def __init__(self, w, bd, **kwargs):
+        super().__init__(**kwargs)
+        self.blocks = [ResidualBlock(w) for _ in range(bd)]
+        self.pool = layers.AveragePooling2D(2)
+        self.w = w
+        self.bd = bd
+        
+    def get_config(self):
+        cfg = super().get_config(); cfg.update({"w": self.w, "bd": self.bd}); return cfg
+        
+    @classmethod
+    def from_config(cls, cfg):
+        return cls(**cfg)
+    
+    def call(self, x, training=None):  # 입력 : (B, sz, sz, C)
+        for block in self.blocks:
+            x = block(x, training = training)
+        skip = x
+        x = self.pool(x)    # for문 끝나고의 출력 : (B, sz / 2, sz / 2, w[2])
+        return x, [skip]    
+    
+    
+class UpBlock(layers.Layer):    
+    def __init__(self, w, bd, **kwargs):
+        super().__init__(**kwargs)
+        self.upsample = layers.UpSampling2D(2, interpolation='bilinear')
+        self.blocks = [ResidualBlock(w) for _ in range(bd)]
+        self.concat = layers.Concatenate()
+        self.w = w
+        self.bd = bd
+        
+    def get_config(self):
+        cfg = super().get_config(); cfg.update({"w": self.w, "bd": self.bd}); return cfg
+        
+    @classmethod
+    def from_config(cls, cfg):
+        return cls(**cfg)
+    
+    def call(self, x, skip, training=None):    # 입력 : (B, sz / 2, sz / 2, C) -> 여기서는 C = w[3] = 768이 들어옴
+        x = self.upsample(x)     # (B, sz, sz, w[3])
+        x = self.concat([x, skip])  # (B, sz, sz, w[2] + w[2])
+        for block in self.blocks:
+            x = block(x, training=training)
+        return x    
+    
 
 
-        # 사전학습된 구조 그대로 만든 TF 레이어
-        # 올바른 인자 전달
-        self.cross_attn = TFBartAttention(
-            embed_dim=self.d_model,
-            num_heads=self.n_heads,
-            dropout=self.attn_drop,
-            is_decoder=True,           # cross-attn이므로 decoder=True
-            name="hf_cross_attn"
-        )
-        #self.cross_attn.trainable = True  # 반드시 명시해줘야 함
-        # attention 출력 차원 → U-Net 채널로 매핑하는 프로젝션
-        self.proj       = layers.Dense(channels)
-        self.proj.trainable = True        # Dense projection도
-        # 이후 build()에서 사용하기 위한 정보 저장
-        self.hf_model   = hf_model
-        self.layer_idx  = layer_idx
+# # 사전학습된 attnetion 불러옴.
+# class CrossAttentionBlock(layers.Layer):
+#     #layer_idx는 층의 인덱스를 나타내는데 BART는 총 attnetion이 6개가 있음. -> 인덱스가 커질수록 low level에서 high level의 의미 정보를 담고 있음
+#     def __init__(self, channels, hf_model="facebook/bart-base", layer_idx=0, **kwargs):
+#         super().__init__(**kwargs)
+#         # BART config: cross-attention 활성화
+#         # Config 로드
+#         config = BartConfig.from_pretrained(hf_model, add_cross_attention=True)
+#         self.d_model   = config.d_model                    # e.g. 768
+#         self.n_heads   = config.decoder_attention_heads    # e.g. 12
+#         self.attn_drop = config.attention_dropout          # 일반적으로 0.0~0.1
+#         # CrossAttentionBlock __init__에서 추가
+#         self.trainable = True             # 전체 Layer도 설정
 
-    def build(self, input_shape):
-        super().build(input_shape)
-        # 실제 BART 가중치 로드
-        bart = TFBartForConditionalGeneration.from_pretrained(self.hf_model)
-        # 디코더 지정 레이어의 encoder_attn weight 추출
-        pretrained = bart.model.decoder.layers[self.layer_idx].encoder_attn
-        # cross_attn 레이어를 실제 입력 형태로 "build" 시켜서 가중치 슬롯 생성
-        # 입력은 (batch, seq_len, d_model)
-        dummy_shape = (None, seq_len, self.d_model)
-        self.cross_attn.build(dummy_shape)
-        # 우리의 cross_attn 레이어에 가중치 덮어쓰기
-        self.cross_attn.set_weights(pretrained.get_weights())
-        self.cross_attn.trainable = True  # build 이후에도 한 번 더 설정
+
+#         # 사전학습된 구조 그대로 만든 TF 레이어
+#         # 올바른 인자 전달
+#         self.cross_attn = TFBartAttention(
+#             embed_dim=self.d_model,
+#             num_heads=self.n_heads,
+#             dropout=self.attn_drop,
+#             is_decoder=True,           # cross-attn이므로 decoder=True
+#             name="hf_cross_attn"
+#         )
+#         #self.cross_attn.trainable = True  # 반드시 명시해줘야 함
+#         # attention 출력 차원 → U-Net 채널로 매핑하는 프로젝션
+#         self.proj       = layers.Dense(channels)
+#         self.proj.trainable = True        # Dense projection도
+#         # 이후 build()에서 사용하기 위한 정보 저장
+#         self.hf_model   = hf_model
+#         self.layer_idx  = layer_idx
+
+#     def build(self, input_shape):
+#         super().build(input_shape)
+#         # 실제 BART 가중치 로드
+#         bart = TFBartForConditionalGeneration.from_pretrained(self.hf_model)
+#         # 디코더 지정 레이어의 encoder_attn weight 추출
+#         pretrained = bart.model.decoder.layers[self.layer_idx].encoder_attn
+#         # cross_attn 레이어를 실제 입력 형태로 "build" 시켜서 가중치 슬롯 생성
+#         # 입력은 (batch, seq_len, d_model)
+#         dummy_shape = (None, seq_len, self.d_model)
+#         self.cross_attn.build(dummy_shape)
+#         # 우리의 cross_attn 레이어에 가중치 덮어쓰기
+#         self.cross_attn.set_weights(pretrained.get_weights())
+#         self.cross_attn.trainable = True  # build 이후에도 한 번 더 설정
+
+#     def call(self, inputs):
+#         x, context = inputs
+#         B, H, W, C = tf.shape(x)[0], tf.shape(x)[1], tf.shape(x)[2], tf.shape(x)[3]
+#         # 공간차원(H×W)을 토큰 길이로 flatten
+#         x_flat     = tf.reshape(x, [B, H*W, C])
+#         # HF cross-attn 출력 (tuple 중 첫 번째가 attn_output)
+#         attn_out   = self.cross_attn(
+#                         x_flat,
+#                         key_value_states=context
+#                     )[0]
+#         self.cross_attn.trainable = True  # build 이후에도 한 번 더 설정
+#         # U-Net 차원으로 프로젝션
+#         attn_proj  = self.proj(attn_out)
+#         # 다시 (B,H,W,C)로 복원
+#         attn_map   = tf.reshape(attn_proj, [B, H, W, C])
+#         # residual 연결
+#         return layers.Add()([x, attn_map])
+
+
+# --- 수정 후: get_config 추가 ---
+class CrossAttentionBlock(layers.Layer):
+    """U-Net 특징맵과 텍스트 컨텍스트 간의 크로스 어텐션을 수행합니다.""" # <- Docstring도 추가 (원인 2 해결)
+    def __init__(self, channels, **kwargs):
+        super().__init__(**kwargs)
+        self.channels = channels # 나중에 get_config에서 사용하기 위해 저장
+        self.mha = layers.MultiHeadAttention(num_heads=8, key_dim=self.channels)
+        self.layernorm = layers.LayerNormalization()
+        self.add = layers.Add()
+
+    def get_config(self):
+        """레이어를 다시 생성하기 위한 설정 정보를 반환합니다."""
+        config = super().get_config()
+        config.update({
+            "channels": self.channels,
+        })
+        return config
 
     def call(self, inputs):
         x, context = inputs
         B, H, W, C = tf.shape(x)[0], tf.shape(x)[1], tf.shape(x)[2], tf.shape(x)[3]
-        # 공간차원(H×W)을 토큰 길이로 flatten
-        x_flat     = tf.reshape(x, [B, H*W, C])
-        # HF cross-attn 출력 (tuple 중 첫 번째가 attn_output)
-        attn_out   = self.cross_attn(
-                        x_flat,
-                        key_value_states=context
-                    )[0]
-        # U-Net 차원으로 프로젝션
-        attn_proj  = self.proj(attn_out)
-        # 다시 (B,H,W,C)로 복원
-        attn_map   = tf.reshape(attn_proj, [B, H, W, C])
-        # residual 연결
-        return layers.Add()([x, attn_map])
+        x_flat = tf.reshape(x, [B, H * W, C])
+        attn_output = self.mha(query=x_flat, key=context, value=context)
+        attn_output = tf.reshape(attn_output, [B, H, W, C])
+        x = self.add([x, self.layernorm(attn_output)])
+        return x
 
+class ConditionalUNet(tf.keras.Model):
+    def __init__(self, sz, ws, bd, ctx_dim, seq_len=77, zdim=64, **kwargs):
+        super().__init__(**kwargs)
+        self.sz = sz
+        self.ws = ws
+        self.bd = bd
+        self.ctx_dim = ctx_dim
+        self.seq_len = seq_len
+        self.zdim = zdim
 
-def get_network_conditional_mask(sz, ws, bd, ctx_dim):
-    noised  = keras.Input((sz,sz,3), name='noised') # train_step에서는 랜덤으로 만든 xt 이미지
-    hazy    = keras.Input((sz,sz,3), name='hazy')
-    tstep   = keras.Input((1,1,1), name='time_emb')
-    context = keras.Input((seq_len,ctx_dim), name='ctx')
-    mask_in = keras.Input((sz,sz,1), name='mask')
+        self.input_conv = layers.Conv2D(ws[0], kernel_size=1)
+        self.sin_embed = layers.Lambda(sinusoidal_embedding)
+        self.emb_proj   = layers.Conv2D(ws[0], kernel_size=1, bias_initializer="zeros")    # 임베딩을 ws[0](=160)으로 사상. 초기엔 영향 0으로 두고 싶으면 'zeros'로.
+        self.e_norm     = layers.LayerNormalization(axis=[1,2,3])
+        self.e_scale    = self.add_weight(
+                            name="e_scale", shape=(ws[0],), dtype=tf.float32,
+                            initializer=tf.keras.initializers.Constant(0.1),
+                            trainable=True)
+        self.up_embed = layers.UpSampling2D(sz , interpolation='nearest')
+        self.out_conv = layers.Conv2D(3, 1, activation=None, kernel_initializer='zeros', bias_initializer="zeros") #kernel_initializer=tf.keras.initializers.RandomNormal(stddev=0.05)
 
-    e = layers.Lambda(sinusoidal_embedding)(tstep)  # 서로 다른 빈도로 변하는 사인,코사인 값들이 합쳐져, network가 몇 번째 스텝인지 구분하기 쉬워짐
-    e = layers.UpSampling2D(sz, interpolation='nearest')(e) #(B,sz,sz,zdim) 여기서는 zdim = 32
+        # 768차원 입력을 받아 우리가 사용할 ctx_dim(512)으로 변환합니다.
+        self.context_projection = layers.Dense(ctx_dim, name="context_projection")
+        
+        # Residual 구조를 인스턴스로 담기
+        self.down_blocks = [DownBlock(w, bd) for w in ws[:-1]]
+        self.mid_blocks = [ResidualBlock(ws[-1]) for _ in range(bd)]
+        self.up_blocks = [UpBlock(w, bd) for w in reversed(ws[:-1])]
+        self.mid_attn = CrossAttentionBlock(ws[-1])
+        
+    def get_config(self):
+        cfg = super().get_config()  # keras의 기본 속성들(name, trainable, dtype 등)을 포함시키기 위해
+        cfg.update({
+            "sz": self.sz,
+            "ws": self.ws,
+            "bd": self.bd,
+            "ctx_dim": self.ctx_dim,
+            "seq_len": self.seq_len,
+            "zdim": self.zdim
+        })
+        return cfg
     
-    x = layers.Concatenate()([noised,hazy]) # (B,sz,sz,6)
-    x = layers.Conv2D(ws[0],kernel_size=1)(x)   #(B, sz, sz, w[0])
-    x = layers.Concatenate()([x, e])        # (B,sz,sz, w[0] + zdim) 여기서 zdim = 32
-    sk = []
+    @classmethod
+    def from_config(cls, cfg):
+        return cls(**cfg)
     
-    # Down: Residual only
-    for w in ws[:-1]:   # 입력 (B, sz, sz, w[0])
-        x = DownBlock(w, bd)([x, sk])   
+    def call(self, inputs, training=True):
+        noised, hazy, gamma, context, mask_in = inputs
+        
+        # 입력된 768차원 context를 512차원으로 변환합니다.
+        # 이 레이어의 가중치는 학습 과정에서 최적화됩니다.
+        projected_context = self.context_projection(context)
+        
+        e = self.e_norm(self.emb_proj(self.up_embed(self.sin_embed(gamma))))
+        e = e * tf.reshape(self.e_scale, [1, 1, 1, -1])  # (B,H,W,C) * (1,1,1,C)
+        
+        # 입력 합성 부분
+        x = tf.concat([noised, hazy, mask_in], axis=-1)   # (B, sz, sz , 7)   # mask_in을  1 - mask_in을 안 하고 그냥 넣으면 뚜렷한 부분을 집중적으로 학습하겠다는 의미
+        x = self.input_conv(x)  # (B, sz, sz, w[0])
+        x = x + e  # (B, sz, sz, w[0])
 
-    for _ in range(bd):
-        x = ResidualBlock(ws[-1])(x)  # for문 이후의 텐서 : (B, sz / 2, sz / 2, w[2])
-    #x = CrossAttentionBlock(ws[-1])([x, context])
+        sk = []
+        for block in self.down_blocks:
+            x, skip = block(x, training=training)     # 이렇게 바꾼이유는 python list를 쓰는 코드는 @tf.function으로 trace될때 동작하지 않을 수 있음 -> run_eagerly=False하면 그래프 tracing 중 무시되서 그럼(True일때는 가능함)
+            sk.extend(skip)
 
-    # Up: Residual only
-    for w in reversed(ws[:-1]):
-        x = UpBlock(w, bd)([x, sk]) # 출력 (B, sz, sz, w[0])
+        for block in self.mid_blocks:
+            x = block(x, training = training)
+        x = self.mid_attn([x, projected_context])
+        
+        for block in self.up_blocks:
+            skip = sk.pop()
+            x = block(x, skip, training=training)
 
-    out = layers.Conv2D(3, 1, activation='linear', kernel_initializer= 'he_normal')(x)     # 예측된 노이즈를 담고 있는 텐서 출력 (B, sz,sz, 3)
-    return keras.Model([noised, hazy, tstep, context, mask_in], out) # out = 𝜖^𝜃
-
-
+        out = self.out_conv(x)
+        return out
+    
 # 전역 평균과 표준편차
+
 FIXED_MEAN = tf.constant([0.5, 0.5, 0.5], dtype=tf.float32)
-FIXED_STD  = tf.constant([0.25, 0.25, 0.25], dtype=tf.float32)
+FIXED_STD  = tf.constant([0.5, 0.5, 0.5], dtype=tf.float32)
 
 def normalize_img(img):
     """[0,1] 범위의 이미지를 고정된 평균/표준편차로 정규화"""
@@ -437,20 +531,38 @@ class EpochTracker(tf.keras.callbacks.Callback):
         self.model.current_epoch = epoch
         
         
-class DiffusionModel(keras.Model):
+class DiffusionModel(tf.keras.Model):
     def __init__(self, sz, ws, bd, ctx_dim):
         super().__init__()
         self.mask_pred = build_mask_predictor()
         self.mask_pred.trainable = False
-        self.network   = get_network_conditional_mask(sz,ws,bd,ctx_dim)
+        #self.network   = get_network_conditional_mask(sz,ws,bd,ctx_dim)
+        self.network = ConditionalUNet(sz, ws, bd, ctx_dim)
+        self.ema_network = tf.keras.models.clone_model(self.network)
+        self.ema_network.set_weights(self.network.get_weights())
+        self.ema_network.trainable = False
         self.normalizer = normalize_img
         self.loss_fn   = keras.losses.MeanSquaredError()
+        self.grad_accumulator = None
 
     def call(self, inputs, training=True):
         return self.network(inputs, training=training)
 
-    def compile(self, optimizer):
-        super().compile(optimizer=optimizer, loss=self.loss_fn)
+    def compile(self, optimizer, **kwargs):
+        super().compile(optimizer=optimizer, loss=self.loss_fn, **kwargs)
+        # 손실 and 평가 지표 확인용
+        self.noise_loss_tracker = keras.metrics.Mean(name="noise_loss")
+        self.image_loss_tracker = keras.metrics.Mean(name="image_loss")
+        self.psnr_metric        = keras.metrics.Mean(name="psnr")
+        self.ssim_metric        = keras.metrics.Mean(name="ssim")
+        # 그래디언트 누적을 위한 변수 초기화
+        self.step_counter = tf.Variable(0, trainable=False, dtype=tf.int64)
+        
+    @property #함수 메소드를 인자로 사용가능 
+    def metrics(self):
+        # 모델이 추적하는 리스트 반환
+        #return [self.noise_loss_tracker, self.image_loss_tracker, self.kid]
+        return [self.noise_loss_tracker, self.image_loss_tracker, self.psnr_metric, self.ssim_metric]
         
     def denormalize(self, images):
         # convert the pixel values back to 0-1 range
@@ -465,14 +577,19 @@ class DiffusionModel(keras.Model):
     #     # 3) 그 각도의 사인·코사인 값을 그대로 노이즈 비율(nr)과
     #     #  신호 비율(sr)로 반환합니다
     #     return tf.sin(ang), tf.cos(ang) #sin이 노이즈비율 , cos이 신호비율
+    
     def diffusion_schedule(self, t, s=0.008):   # normalized cosine scheduler
         ft = tf.cos((t + s) / (1 + s) * math.pi / 2) ** 2
-        #alpha_bar = ft  # normalize 안 하고 그대로 사용하거나,
-        alpha_bar = ft / tf.reduce_max(ft)  # 정규화를 통해 최댓값이 1.0이 되도록 하는 방식도 가능
+        c0 = math.cos((s / (1 + s)) * math.pi / 2.0) ** 2
+        alpha_bar = ft / c0                      # ← 정규화
         alpha_bar = tf.clip_by_value(alpha_bar, min_signal_rate, max_signal_rate)
         sr = tf.sqrt(alpha_bar)
         nr = tf.sqrt(1.0 - alpha_bar)
         return nr, sr
+    
+    def make_gamma(self, nr, sr, eps=1e-12):
+        # nr = sqrt(1 - alpha_bar), sr = sqrt(alpha_bar)
+        return tf.math.log(tf.square(sr) + eps) - tf.math.log(tf.square(nr) + eps)  # logSNR
     
     def train_step(self, data):
         hazy, clear, context = data
@@ -481,50 +598,63 @@ class DiffusionModel(keras.Model):
         b       = tf.shape(clear_n)[0]
         noise   = tf.random.normal((b,img_siz,img_siz,3))
        # (1) 1,2,…,T 중 하나를 균일 샘플링 (정수)
-        t_int = tf.random.uniform(
-        shape=(b,),
-        minval=1,
-        maxval=kid_diffusion_steps+1,  # maxval은 exclusive 이므로 +1
-        dtype=tf.int32
+        t = tf.random.uniform(
+        shape=(b, 1, 1, 1), 
+        minval=0.0, maxval=1.0,
+        dtype=tf.float32
         )
-        # (2) 0~1로 정규화
-        t = tf.cast(t_int, tf.float32) / tf.cast(kid_diffusion_steps, tf.float32)
-        # (3) 네트워크 입력 형태로 reshape
-        t = tf.reshape(t, [b, 1, 1, 1])
-        
+
         nr,sr   = self.diffusion_schedule(t)
+        gamma = self.make_gamma(nr, sr)
         x_noi   = sr * clear_n + nr * noise
-        mask = self.mask_pred(hazy_n, training=False,)
+        
+        mask = self.mask_pred(hazy_n, training=False)
+        
+        #  학습 전 가중치 복사 (Graph-safe) -> 디버깅용
+        before = tf.identity(self.network.trainable_weights[0])
+    
         with tf.GradientTape() as tape:
-            tape.watch(x_noi)
-            pred = self.network([x_noi, hazy_n, t, context, mask], training=True)
+            
+            pred = self.network([x_noi, hazy_n, gamma, context, mask], training=True)
             
             
             # #context가 적용이 제대로 되는지에 대한 디버깅 파트
             # pred_zero_context = self.network([x_noi, hazy_n, t, tf.zeros_like(context), mask], training=False)
-            # tf.print("▶ train diff norm(context 적용되는가):", tf.norm(pred - pred_zero_context))
+            # if tf.executing_eagerly():
+            #   tf.print("▶ train diff norm(context 적용되는가):", tf.norm(pred - pred_zero_context))
             
             #mask 적용된게 끝까지 잘 가는지에 대한 디버깅 파트
             zero_mask = tf.zeros_like(mask)
             zero_mask = tf.cast(zero_mask, dtype=mask.dtype)
-            pred_zero_mask = self.network([x_noi, hazy_n, t, context, zero_mask], training=False)
+            zero_mask.set_shape(mask.shape)
+            pred_zero_mask = self.network([x_noi, hazy_n, gamma, context, zero_mask], training=False)
             diff   = tf.norm(pred - pred_zero_mask)
             norm_r = tf.norm(pred)
 
-            ratio = diff / (norm_r + 1e-8)
-            tf.print("▶ diff norm:", diff, "|| pred_r norm:", norm_r, 
-                    "▶ ratio(mask 적용되는가):", ratio)      # 0.05(5%) 이상으로 나온다면 mask가 예측에 눈에 띄게 기여하고 있는거임. 1% 미만이면 mask 영향이 거의 사라진 상태임
+            mask_ratio = diff / (norm_r + 1e-8)
+            # if tf.executing_eagerly():
+            #     tf.print("\n▶ diff norm:", diff, "|| pred_r norm:", norm_r, 
+            #         "▶ mask_ratio:", mask_ratio)      # 0.03 ~ 0.15까지 정상    0.4 위면 오버컨디셔닝 의심
             
-            epoch = getattr(self, 'current_epoch', 0)
+        
+     
+            # # 디버깅: e 효과 확인
+            # pn0 = self.network([x_noi, hazy_n, gamma*0, context, mask], training=False)  # or 내부에서 e_scale=0로 강제
+            # t_ratio = tf.norm(pred - pn0) / (tf.norm(pred) + 1e-8)
+            # tf.print("▶ t_ratio:", t_ratio)     # 0.03~ 0.12면 정상
+            
+            
             pred_x0 = (x_noi - nr * pred) / sr
             
-            ## -> 이거 안 하는게 좋을거 같다. -=> 초반에 튀게 해줘야지 학습이 제대로 될거 같음
-            # if epoch < 10:
-            #     pred_x0 = tf.tanh(pred_x0 * 0.7)
+            #epoch = getattr(self, 'current_epoch', 0)
+            # # -> 이거 안 하는게 좋을거 같다. -=> 초반에 튀게 해줘야지 학습이 제대로 될거 같음
+            # if epoch > 35:
+            #     pred_x0 = tf.clip_by_value(pred_x0, -3.0, 3.0)
             # else:
             #     pred_x0 = pred_x0
-            
-            tf.print("pred shape:", tf.shape(pred), "min/max:", tf.reduce_min(pred), "/", tf.reduce_max(pred))            
+
+            # if tf.executing_eagerly():
+            #     tf.print("pred shape:", tf.shape(pred), "min/max:", tf.reduce_min(pred), "/", tf.reduce_max(pred))            
                         
             # # epoch에 따라 w_noise 증감
             # r = epoch / num_epochs
@@ -532,14 +662,78 @@ class DiffusionModel(keras.Model):
             # w_x0    = 1 - w_noise
             # loss = w_noise * self.loss_fn(pred, noise) \
             #     + w_x0    * self.loss_fn(pred_x0, clear_n)
-            loss = self.loss_fn(pred, noise)
-            tf.print("pred_x0 mean/std:", tf.reduce_mean(pred_x0), "/", tf.math.reduce_std(pred_x0))    # pred_mean = -0.05 ~ 0.05, pred_std = 0.4 ~ 0.6이면 정상 범위
-            tf.print("clear_n mean/std:", tf.reduce_mean(clear_n), "/", tf.math.reduce_std(clear_n))
+            noise_loss = self.loss_fn(pred, noise)      # 학습 기준
+            total_loss = noise_loss / float(gradient_accumulation_steps) # 손실 스케일링
+            image_loss = self.loss_fn(clear_n, pred_x0) # 모니터링용
+            # PSNR/SSIM: GT는 clear_n 기준으로
+            psnr = tf.reduce_mean(tf.image.psnr(clear_n, pred_x0, max_val=2.0))
+            ssim = tf.reduce_mean(tf.image.ssim(clear_n, pred_x0, max_val=2.0))
+            
+            
+            # if tf.executing_eagerly():
+            #     tf.print("pred_x0 mean/std:", tf.reduce_mean(pred_x0), "/", tf.math.reduce_std(pred_x0))    # pred_mean = -0.05 ~ 0.05, pred_std = 0.4 ~ 0.6이면 정상 범위
+            #     tf.print("clear_n mean/std:", tf.reduce_mean(clear_n), "/", tf.math.reduce_std(clear_n))
 
-        grads = tape.gradient(loss, self.network.trainable_weights)
-        self.optimizer.apply_gradients(zip(grads, self.network.trainable_weights))
-        tf.print("max grad:", tf.reduce_max([tf.reduce_max(tf.abs(g)) for g in grads if g is not None]))
-        return {'loss_train': loss}
+        grads = tape.gradient(total_loss, self.network.trainable_weights)
+        
+        
+        #  그래디언트 누적
+        if self.grad_accumulator is None:
+            # 첫 스텝에서는 그래디언트 리스트를 생성
+            self.grad_accumulator = [tf.Variable(tf.zeros_like(g), trainable=False) for g in grads]
+
+        # 계산된 그래디언트를 누적 변수에 더함
+        for i in range(len(self.grad_accumulator)):
+            self.grad_accumulator[i].assign_add(grads[i])
+
+        # 스텝 카운터 증가 및 가중치 업데이트
+        self.step_counter.assign_add(1)
+
+        # tf.cond에 사용할 조건(predicate)
+        condition = tf.equal(self.step_counter % gradient_accumulation_steps, 0)
+
+        def apply_and_reset_gradients():
+            """가중치를 업데이트하고 누적기를 리셋하는 함수"""
+            self.optimizer.apply_gradients(zip(self.grad_accumulator, self.network.trainable_weights))
+            for grad_var in self.grad_accumulator:
+                grad_var.assign(tf.zeros_like(grad_var))
+            
+            # EMA 업데이트 로직도 여기에 포함
+            for w, ew in zip(self.network.weights, self.ema_network.weights):
+                ew.assign(0.999 * ew + 0.001 * w)
+
+            # # 디버깅용 가중치 변화량 출력 (Eager mode에서만 실행됨)
+            # if tf.executing_eagerly():
+            #     after = self.network.trainable_weights[0]
+            #     diff = tf.reduce_mean(tf.abs(after - before))
+            #     tf.print("가중치 변화량 : ", diff)
+            
+            return tf.constant(True) # tf.cond는 반환값이 필요함
+
+        def do_nothing():
+            """아무것도 하지 않는 함수"""
+            # EMA 업데이트는 가중치 업데이트 시에만 수행하도록 변경
+            # for w, ew in zip(self.network.weights, self.ema_network.weights):
+            #     ew.assign(0.999 * ew + 0.001 * w)
+            return tf.constant(False)
+
+        # tf.cond를 사용하여 조건부로 가중치 업데이트 실행
+        tf.cond(condition, apply_and_reset_gradients, do_nothing)
+
+
+        # trackers update
+        self.noise_loss_tracker.update_state(noise_loss)
+        self.image_loss_tracker.update_state(image_loss)
+        self.psnr_metric.update_state(psnr)
+        self.ssim_metric.update_state(ssim)
+    
+        # if tf.executing_eagerly():
+        #     tf.print("trainable_weights:", len(self.network.trainable_weights))
+        #     tf.print("max grad:", tf.reduce_max([tf.reduce_max(tf.abs(g)) for g in grads if g is not None]))   
+        
+
+            
+        return {m.name: m.result() for m in self.metrics}
 
     def test_step(self, data):
         hazy, clear, context = data
@@ -548,53 +742,67 @@ class DiffusionModel(keras.Model):
         b       = tf.shape(clear_n)[0]
         noise   = tf.random.normal((b, img_siz, img_siz, 3))
        # (1) 1,2,…,T 중 하나를 균일 샘플링 (정수)
-        t_int = tf.random.uniform(
-        shape=(b,),
-        minval=1,
-        maxval=kid_diffusion_steps+1,  # maxval은 exclusive 이므로 +1
-        dtype=tf.int32
+        t = tf.random.uniform(
+        shape=(b, 1, 1, 1), 
+        minval=0.0, maxval=1.0,
+        dtype=tf.float32
         )
-        # (2) 0~1로 정규화
-        t = tf.cast(t_int, tf.float32) / tf.cast(kid_diffusion_steps, tf.float32)
-        # (3) 네트워크 입력 형태로 reshape
-        t = tf.reshape(t, [b, 1, 1, 1])
         
         nr,sr   = self.diffusion_schedule(t)
+        gamma = self.make_gamma(nr, sr)
+
         x_noi   = sr * clear_n + nr * noise
 
         mask = self.mask_pred(hazy_n, training=False)
-        pred = self.network([x_noi, hazy_n, t, context, mask], training=False)
-        loss = self.loss_fn(noise, pred)
-        return {'loss_test': loss}
+        #  EMA로 예측
+        pred_noise = self.ema_network([x_noi, hazy_n, gamma, context, mask], training=False)
+        pred_x0 = (x_noi - nr * pred_noise) / sr
+        
+        noise_loss = self.loss_fn(noise, pred_noise)
+        image_loss = self.loss_fn(clear_n, pred_x0)
+        # PSNR/SSIM: GT는 clear_n 기준으로
+        psnr = tf.reduce_mean(tf.image.psnr(clear_n, pred_x0, max_val=2.0))
+        ssim = tf.reduce_mean(tf.image.ssim(clear_n, pred_x0, max_val=2.0))
+        
+        # trackers는 일반적으로 train 전용이지만, 간단히 여기서도 업데이트 가능(선택)
+        self.noise_loss_tracker.update_state(noise_loss)
+        self.image_loss_tracker.update_state(image_loss)
+        self.psnr_metric.update_state(psnr)
+        self.ssim_metric.update_state(ssim)
+
+        return {m.name: m.result() for m in self.metrics}
+
 
     def dehaze(self, hazy_imgs, ctx, steps=kid_diffusion_steps):   
         hazy_n = self.normalizer(hazy_imgs)
 
         noise = tf.random.normal((tf.shape(hazy_n)[0], img_siz, img_siz, 3))
         next_x = noise
-        mask = self.mask_pred(hazy_imgs, training=False)
+        mask = self.mask_pred(hazy_n, training=False)
         for i in reversed(range(steps)):
 
             x = next_x
             t = tf.fill([tf.shape(x)[0], 1, 1, 1], i / steps)
             nr, sr = self.diffusion_schedule(t)
+            gamma = self.make_gamma(nr, sr)
 
-            # 1) 네트워크에서 예측된 노이즈
-            pn = self.network([x, hazy_n, t, ctx, mask], training=False)
+            # 1) 네트워크에서 예측된 노이즈 -> train에서의 ema_network 사용
+            pn = self.ema_network([x, hazy_n, gamma, ctx, mask], training=False)
 
             # 2) 학습 시와 동일하게 tanh 스케일링 적용
             px0_raw = (x - nr * pn) / sr
+            
             epoch = getattr(self, 'current_epoch', 0)
-            # if epoch < 10:
-            #     pred_x0 = tf.tanh(px0_raw * 0.7)
-            #     # 3) (Optional) tanh 이후에만 클리핑
-            #     px0 = tf.clip_by_value(pred_x0, -1.0, 1.0)
+            # if epoch > 35:
+            #     px0 = tf.clip_by_value(px0_raw, -3.0, 3.0)
             # else:
             #     px0 = px0_raw
+
             px0 = px0_raw
 
             # 4) 디버깅용 출력 (분포 확인)
-            tf.print("clippingX px0 min/max:", tf.reduce_min(px0_raw), "/", tf.reduce_max(px0_raw))   # tf.tanh 적용시키기 전
+            if tf.executing_eagerly():
+                tf.print("clippingX px0 min/max:", tf.reduce_min(px0_raw), "/", tf.reduce_max(px0_raw))   # tf.tanh 적용시키기 전
 
             # 5) 다음 스텝으로 업데이트
             next_t = t - 1.0 / steps
@@ -610,19 +818,25 @@ class DiffusionModel(keras.Model):
 
         for hazy_b, clear_b, ctx_b in val_ds.take(1):
             dehazed_b = self.dehaze(hazy_b, ctx_b)  # [-1,1] 범위
-            print("before clip x0 min/max:", dehazed_b.numpy().min(), dehazed_b.numpy().max())
-            # dehazed_b = tf.clip_by_value(dehazed_b, -1.0, 1.0)
-            print("after clip x0 min/max:", dehazed_b.numpy().min(), dehazed_b.numpy().max())
-            dehazed_b = self.denormalize(dehazed_b).numpy()  #[0,1] 범위
-            print("x0 min/max:", tf.reduce_min(dehazed_b).numpy(), "/", tf.reduce_max(dehazed_b).numpy())
-            print("x0 mean/std:", tf.reduce_mean(dehazed_b).numpy(), "/", tf.math.reduce_std(dehazed_b).numpy())
-            dehazed_b = tf.clip_by_value(dehazed_b, 0.0, 1.0)
+            if tf.executing_eagerly():
+                tf.print("before clip x0 min/max:", tf.reduce_min(dehazed_b), "/", tf.reduce_max(dehazed_b))    
+            
+            dehazed_b = tf.clip_by_value(dehazed_b, -1.0, 1.0)
+            if tf.executing_eagerly():
+                tf.print("after clip x0 min/max:", tf.reduce_min(dehazed_b), "/", tf.reduce_max(dehazed_b))
+            
+            dehazed_b = self.denormalize(dehazed_b)  #[0,1] 범위
+            if tf.executing_eagerly():
+                tf.print("x0 min/max:", tf.reduce_min(dehazed_b), "/", tf.reduce_max(dehazed_b))
+                tf.print("x0 mean/std:", tf.reduce_mean(dehazed_b), "/", tf.math.reduce_std(dehazed_b))            
+            
+            
             batch_size = hazy_b.shape[0]
             fig, axs = plt.subplots(batch_size, 3, figsize=(12, 4 * batch_size))
 
             for i in range(batch_size):
-                hazy = hazy_b[i].numpy()    # (img_siz, img_siz, 3), float32, 0~1
-                clear = clear_b[i].numpy()  # (img_siz, img_siz, 3), float32, 0~1
+                hazy = hazy_b[i]   # (img_siz, img_siz, 3), float32, 0~1
+                clear = clear_b[i] # (img_siz, img_siz, 3), float32, 0~1
 
                 dehazed = dehazed_b[i]          # 이미 numpy 상태임
 
@@ -652,70 +866,142 @@ _ = model.network([
     tf.zeros((1,img_siz,img_siz,3)),
     tf.zeros((1,img_siz,img_siz,3)),
     tf.zeros((1,1,1,1)),
-    tf.zeros((1,seq_len,ctx_dim)),
+    tf.zeros((1,seq_len,768)),
     tf.zeros((1,img_siz,img_siz,1))
 ])
+
+_ = model.ema_network([
+    tf.zeros((1,img_siz,img_siz,3)),
+    tf.zeros((1,img_siz,img_siz,3)),
+    tf.zeros((1,1,1,1)),
+    tf.zeros((1,seq_len,768)),
+    tf.zeros((1,img_siz,img_siz,1))
+], training=False)
+model.ema_network.set_weights(model.network.get_weights())
 
 # ─── 12.5) 모델 빌드(dummy call) ───
 dummy_hazy  = tf.zeros((1, img_siz, img_siz, 3), dtype=tf.float32)
 dummy_t     = tf.zeros((1, 1, 1, 1), dtype=tf.float32)
-dummy_ctx   = tf.zeros((1, seq_len, ctx_dim), dtype=tf.float32)
+dummy_ctx   = tf.zeros((1, seq_len, 768), dtype=tf.float32)
 dummy_mask  = tf.zeros((1, img_siz, img_siz, 1), dtype=tf.float32)
 
 _ = model([dummy_hazy, dummy_hazy, dummy_t, dummy_ctx, dummy_mask], training=False)
 
 
-#GT data set의 평균과 표준편차 확인---------------
-mean_accum = tf.Variable(tf.zeros([3], dtype=tf.float32))
-std_accum  = tf.Variable(tf.zeros([3], dtype=tf.float32))
-n = 0
+# #GT data set의 평균과 표준편차 확인---------------
+# mean_accum = tf.Variable(tf.zeros([3], dtype=tf.float32))
+# std_accum  = tf.Variable(tf.zeros([3], dtype=tf.float32))
+# n = 0
 
-for _, gt, *_ in train_ds.take(6000):  # 🔁 두 번째 요소 = clear image
-    tf.print("GT min:", tf.reduce_min(gt), "max:", tf.reduce_max(gt))  # [0,1] 또는 [-1,1] 확인
-    gt = tf.reshape(gt, [-1, 3])
-    mean_accum.assign_add(tf.reduce_mean(gt, axis=0))
-    std_accum.assign_add(tf.math.reduce_std(gt, axis=0))
-    n += 1
 
-tf.print("📊 GT mean:", mean_accum / n)
-tf.print("📊 GT std :", std_accum / n)
+# for _, gt, *_ in train_ds.take(6000):  # 🔁 두 번째 요소 = clear image
+#     #if tf.executing_eagerly():
+#        tf.print("GT min:", tf.reduce_min(gt), "max:", tf.reduce_max(gt))  # [0,1] 또는 [-1,1] 확인
+#     gt = tf.reshape(gt, [-1, 3])
+#     mean_accum.assign_add(tf.reduce_mean(gt, axis=0))
+#     std_accum.assign_add(tf.math.reduce_std(gt, axis=0))
+#     n += 1
+
+# if tf.executing_eagerly():
+#   tf.print("📊 GT mean:", mean_accum / n) # 📊 GT mean: [0.45907 0.434806436 0.421944499]
+#   tf.print("📊 GT std :", std_accum / n) #📊 GT std : [0.26653102 0.270138741 0.289018691]
+
 
 
 # ─── 13) 학습 설정 & 실행 ───
 model.compile(
-    optimizer=keras.optimizers.Adam(1e-4)       # 학습률을 보통 1e-4를 사용. 1e-5는 안정성 확보할때 사용
+    optimizer=optimizers.Adam(5e-5)       # 학습률을 보통 1e-4를 사용. 1e-5는 안정성 확보할때 사용
 )
-model.run_eagerly = False   # 디버깅할때는 True로 바꾸고
 
-checkpoint_cb = keras.callbacks.ModelCheckpoint(
-    filepath=os.path.join(checkpoint_dir, "weights_epoch_{epoch:02d}.weights.h5"),
+
+
+print("전체 trainable weight 수:", len(model.network.trainable_variables))  # 72개 나옴
+for v in model.network.trainable_variables:
+    print("✅", v.name, v.shape)
+    
+    
+model.run_eagerly = False   # 디버깅할때는 True로 바꾸자
+
+# 파이썬의 if문은 tf.equal()과 같은 결과가 나중에 계싼될 예정인 텐서를 반환하는 것과 충돌을 일으킴
+
+per_epoch_cb = keras.callbacks.ModelCheckpoint(
+    filepath=os.path.join(
+        checkpoint_dir,
+        "epoch{epoch:03d}-valNoise{val_noise_loss:.5f}.net.weights.h5"  # 로그값도 파일명에!
+    ),
     save_weights_only=True,
     save_freq='epoch',
+    save_best_only=False,   # ← 매 에폭 저장
+    verbose=0,
+)
+
+best_cb = keras.callbacks.ModelCheckpoint(    # 베스트만 저장
+    filepath=os.path.join(checkpoint_dir, "best.weights.h5"),
+    save_weights_only=True,
+    monitor="val_noise_loss",   # 어떤 지표가 좋아졌을때 저장할지 -> 베스트 모델만 저장하려고 이렇게 함
+    mode="min",#최소기준
+    save_best_only=True,
     verbose=1
 )
 
+
+last_cb = keras.callbacks.ModelCheckpoint(  # 매 에폭의 마지막 가중치 저장
+    filepath=os.path.join(checkpoint_dir, "last.weights.h5"),
+    save_weights_only=True,
+    save_freq="epoch",
+    verbose=0,
+)
 
 for v in model.trainable_variables:
     if "hf_cross_attn" in v.name:
         print(f"✅ 학습 대상: {v.name}")
         
-steps_per_epoch = 200 #len(hazy_files) // batch_siz
-val_steps = kid_diffusion_steps #len(hazy_test_files)//batch_siz
 
 print("steps_per_epoch : ", steps_per_epoch)
 print("fit 이전")
-model.fit(
+
+checkpoint_path = "/home/jang/DDIM_python/paper/checkpoints_weights/last.weights.h5"  # -> 34에서 끊겨서 마지막 가중치 불러와서 시작
+# 모델에 가중치 로드
+model.load_weights(checkpoint_path)
+
+history = model.fit(
     train_ds,
     validation_data=val_ds,
     epochs=num_epochs,
+    initial_epoch=34,            # 시작할 에폭 번호 -> 34에서 끊겨서 여기서 시작
     steps_per_epoch=steps_per_epoch,   #한 epoch 당 배치 개수
     validation_steps=val_steps,
-    callbacks=[checkpoint_cb,
-    keras.callbacks.LambdaCallback(
-        on_epoch_end=lambda epoch, 
-        logs: model.plot_images(epoch, logs, val_ds=val_ds)
-    ),#이미지 생성
-    EpochTracker()
-]
+    verbose = 1,
+    callbacks=[
+        per_epoch_cb,
+        best_cb,
+        last_cb,
+        keras.callbacks.LambdaCallback(
+            on_epoch_end=lambda epoch, 
+            logs: model.plot_images(epoch, logs, val_ds=val_ds)
+        ),#이미지 생성
+        EpochTracker()
+    ]
+    
 )
-print("fit 이후")
+
+# 시각화
+plt.figure(figsize=(12, 6))
+
+# 기록된 메트릭 시각화
+for key in history.history:
+    if key in ['noise_loss', 'image_loss', 'psnr', 'ssim',
+               'val_noise_loss', 'val_image_loss', 'val_psnr', 'val_ssim']:
+        plt.plot(history.history[key], label=key)
+
+plt.xlabel("Epochs")
+plt.ylabel("Metric")
+plt.title("Training & Validation Metrics")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+
+# 저장
+os.makedirs("plots", exist_ok=True)
+plt.savefig("plots/loss_curve.png", dpi=150)
+plt.close()
