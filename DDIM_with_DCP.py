@@ -21,6 +21,7 @@ import matplotlib.pyplot as plt
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers, optimizers
+from tensorflow.keras import backend as K   # Keras 백엔드를 직접 사용하기 위해 임포트
 
 from pathlib import Path
 from transformers import BlipProcessor, BlipForConditionalGeneration, BlipTextModel, BartConfig, TFBartForConditionalGeneration
@@ -960,15 +961,35 @@ for v in model.trainable_variables:
 print("steps_per_epoch : ", steps_per_epoch)
 print("fit 이전")
 
-checkpoint_path = "/home/jang/DDIM_python/paper/checkpoints_weights/last.weights.h5"  # -> 34에서 끊겨서 마지막 가중치 불러와서 시작
+checkpoint_path = "/home/jang/DDIM_python/paper/checkpoints_weights/epoch043-valNoise0.01243.net.weights.h5"  # -> 43에서 끊겨서 마지막 가중치 불러와서 시작
 # 모델에 가중치 로드
 model.load_weights(checkpoint_path)
+
+# 알아서 학습률 조정해줌
+lr_scheduler = tf.keras.callbacks.ReduceLROnPlateau(
+    monitor='val_noise_loss', # 이 지표의 개선을 관찰
+    factor=0.2,             # 개선이 없을 경우, 현재 학습률에 0.2를 곱함 (예: 5e-6 -> 1e-6).
+    patience=5,             # 5 에폭 동안 monitor 지표가 개선되지 않으면 학습률을 줄입니다.
+    min_lr=1e-7,            # 학습률이 이 값 밑으로 떨어지지 않도록 하한선을 설정합니다.
+    verbose=1               # 콜백이 실행될 때 로그를 출력합니다.
+)
+
+
+
+class LearningRateLogger(tf.keras.callbacks.Callback):
+    """매 에폭이 끝날 때마다 학습률을 로그에 기록하는 콜백"""
+    def on_epoch_end(self, epoch, logs=None):
+        logs = logs or {}
+        # 새로운 방식(.learning_rate)으로 학습률을 가져옵니다.
+        lr = self.model.optimizer.learning_rate
+        # Keras 내부 값을 가져오기 위해 backend.get_value 사용
+        logs['lr'] = K.get_value(lr)
 
 history = model.fit(
     train_ds,
     validation_data=val_ds,
     epochs=num_epochs,
-    initial_epoch=34,            # 시작할 에폭 번호 -> 34에서 끊겨서 여기서 시작
+    initial_epoch=44,            # 시작할 에폭 번호 -> 41에서 끊겨서 여기서 시작
     steps_per_epoch=steps_per_epoch,   #한 epoch 당 배치 개수
     validation_steps=val_steps,
     verbose = 1,
@@ -980,7 +1001,9 @@ history = model.fit(
             on_epoch_end=lambda epoch, 
             logs: model.plot_images(epoch, logs, val_ds=val_ds)
         ),#이미지 생성
-        EpochTracker()
+        EpochTracker(),
+        lr_scheduler,
+        LearningRateLogger()
     ]
     
 )
