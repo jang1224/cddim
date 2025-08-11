@@ -989,7 +989,7 @@ history = model.fit(
     train_ds,
     validation_data=val_ds,
     epochs=num_epochs,
-    initial_epoch=44,            # 시작할 에폭 번호 -> 41에서 끊겨서 여기서 시작
+    initial_epoch=44,            # 시작할 에폭 번호 -> 43에서 끊겨서 여기서 시작
     steps_per_epoch=steps_per_epoch,   #한 epoch 당 배치 개수
     validation_steps=val_steps,
     verbose = 1,
