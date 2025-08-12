@@ -46,8 +46,8 @@ for g in gpus:
 
 
 # ─── 3) 하이퍼파라미터 ───
-img_siz             = 64
-batch_siz           = 8
+img_siz             = 128
+batch_siz           = 16
 gradient_accumulation_steps = 4
 effective_batch_siz = batch_siz * gradient_accumulation_steps
 kid_diffusion_steps = 50    # ← must be before class definition
@@ -136,22 +136,22 @@ contexts_test = [''] * len(hazy_test_files) # 빈 캡션 리스트 (테스트용
 assert len(hazy_files)==len(ref_files), "파일 개수 불일치"
 print("✔ 총 이미지 쌍:", len(hazy_files))
 
-# def encode_context(text_str: str) -> np.ndarray:
-#     """
-#     문자열(text_str) → BLIP 텍스트 인코더 last_hidden_state[0]
-#     → NumPy (seq_len, ctx_dim) float32 배열 반환
-#     """
-#     inputs = txt_processor_blip(
-#         [text_str],
-#         padding="max_length", truncation=True, max_length=seq_len,
-#         return_tensors="pt"
-#     )   #.to("cuda") -> gpu사용량 줄이려고
+def encode_context(text_str: str) -> np.ndarray:
+    """
+    문자열(text_str) → BLIP 텍스트 인코더 last_hidden_state[0]
+    → NumPy (seq_len, ctx_dim) float32 배열 반환
+    """
+    inputs = txt_processor_blip(
+        [text_str],
+        padding="max_length", truncation=True, max_length=seq_len,
+        return_tensors="pt"
+    )   #.to("cuda") -> gpu사용량 줄이려고
 
-#     with torch.no_grad():
-#         outputs = txt_model_blip(**inputs)
-#         emb = outputs.last_hidden_state[0]  # (seq_len, ctx_dim)
+    with torch.no_grad():
+        outputs = txt_model_blip(**inputs)
+        emb = outputs.last_hidden_state[0]  # (seq_len, ctx_dim)
 
-#     return emb.cpu().numpy().astype(np.float32)
+    return emb.cpu().numpy().astype(np.float32)
 
 
 # # context 임베딩된거 저장------------------
@@ -217,6 +217,24 @@ def load_pair_test(h_path, r_path, _):
     
     return hazy, clear, ctx
 
+def load_pair_test_ihaze(h_path, r_path, _):
+    hazy  = tf.image.resize(_read_image(h_path),  [img_siz, img_siz])
+    clear = tf.image.resize(_read_image(r_path), [img_siz, img_siz])
+
+    def _generate_context(h_path_bytes):
+        path = h_path_bytes.numpy().decode("utf-8")
+        img  = Image.open(path).convert("RGB")
+        inp  = processor_blip(img, return_tensors="pt") #.to("cuda") -> gpu 사용량 줄이려고
+        out  = model_blip.generate(**inp, max_length=50)
+        cap  = processor_blip.decode(out[0], skip_special_tokens=True)
+        return encode_context(cap)
+
+    # train과 동일하게 .npy 파일을 읽어옴.
+    ctx = tf.py_function(_generate_context, [h_path], tf.float32)
+    ctx.set_shape([seq_len, 768]) # 원본 임베딩 차원
+    
+    return hazy, clear, ctx
+
 
 # ——— train/test Dataset 정의 ———
 ds_train = tf.data.Dataset.from_tensor_slices((hazy_files, ref_files, contexts))
@@ -242,6 +260,7 @@ val_ds = (
     .batch(batch_siz)
     .prefetch(tf.data.AUTOTUNE)
 )
+
 ######################### ihaze도 보려고 따로 만든 데이터 셋
 ihaze_base_dir = '/mnt/c/Users/조장혁/Downloads/RESIDE-6K/RESIDE-6K/test/I-haze'
 ihaze_hazy_dir = os.path.join(ihaze_base_dir, 'I-haze_hazy')
@@ -256,7 +275,7 @@ ihaze_ds_test  = tf.data.Dataset.from_tensor_slices((ihaze_hazy_files, ihaze_cle
 
 ihaze_ds = (
     ihaze_ds_test
-    .map(load_pair_test, num_parallel_calls=1)
+    .map(load_pair_test_ihaze, num_parallel_calls=1)
     .repeat()
     .batch(batch_siz)
     .prefetch(tf.data.AUTOTUNE)
