@@ -21,6 +21,7 @@ import matplotlib.pyplot as plt
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers, optimizers
+from tensorflow.keras.losses import MeanAbsoluteError
 
 from pathlib import Path
 from transformers import BlipProcessor, BlipForConditionalGeneration, BlipTextModel, BartConfig, TFBartForConditionalGeneration
@@ -33,6 +34,8 @@ from datasets import load_dataset
 # from tqdm import tqdm
 
 import gc # gc.collect()를 사용하기 위해 import -> 가비지 컬렉션을 위해 스크립트 상단에 추가
+import glob # 각 에폭마다 생성할때 필요
+import re   # 각 에폭마다 생성할때 필요
 
 np.random.seed(None)
 tf.random.set_seed(None)
@@ -45,15 +48,15 @@ for g in gpus:
 
 # ─── 3) 하이퍼파라미터 ───
 img_siz             = 128
-batch_siz           = 16
+batch_siz           = 8
 gradient_accumulation_steps = 4
 effective_batch_siz = batch_siz * gradient_accumulation_steps
 kid_diffusion_steps = 100    # ← must be before class definition
 min_signal_rate     = 1e-4 #0.02
 max_signal_rate     = 0.95 #0.95
-zdim                = 64
+zdim                = 128
 embed_max_freq      = 1000.0
-widths              = [64, 128, 256, 256]#[160,320,768,768] # 768인 이유는 bottleneck 채널수와 crossattention(BART)의 d_model = 768로 같아야 가중치 로드가 에러 없이 됨.
+widths              = [64, 128, 256, 256]    #[160,320,768,768] # 768인 이유는 bottleneck 채널수와 crossattention(BART)의 d_model = 768로 같아야 가중치 로드가 에러 없이 됨.
 block_depth         = 2
 ctx_dim             = 256
 seq_len             = 77    # tokenizer max length
@@ -232,6 +235,7 @@ def load_pair_test_ihaze(h_path, r_path, _):
     ctx.set_shape([seq_len, 768]) # 원본 임베딩 차원
     
     return hazy, clear, ctx
+
 
 # ——— train/test Dataset 정의 ———
 ds_train = tf.data.Dataset.from_tensor_slices((hazy_files, ref_files, contexts))
@@ -523,7 +527,7 @@ class DiffusionModel(tf.keras.Model):
         self.ema_network.set_weights(self.network.get_weights())
         self.ema_network.trainable = False
         self.normalizer = normalize_img
-        self.loss_fn   = keras.losses.MeanSquaredError()
+        self.loss_fn   = keras.losses.MeanAbsoluteError()   # L1으로 해볼게요
         self.grad_accumulator = None
 
     def call(self, inputs, training=True):
@@ -656,17 +660,26 @@ class DiffusionModel(tf.keras.Model):
             #     tf.print("pred_x0 mean/std:", tf.reduce_mean(pred_x0), "/", tf.math.reduce_std(pred_x0))    # pred_mean = -0.05 ~ 0.05, pred_std = 0.4 ~ 0.6이면 정상 범위
             #     tf.print("clear_n mean/std:", tf.reduce_mean(clear_n), "/", tf.math.reduce_std(clear_n))
 
-        grads = tape.gradient(total_loss, self.network.trainable_weights)
-        
-        
-        #  그래디언트 누적
-        if self.grad_accumulator is None:
-            # 첫 스텝에서는 그래디언트 리스트를 생성
-            self.grad_accumulator = [tf.Variable(tf.zeros_like(g), trainable=False) for g in grads]
+        vars_ = self.network.trainable_weights
+        grads = tape.gradient(total_loss, vars_)
 
-        # 계산된 그래디언트를 누적 변수에 더함
-        for i in range(len(self.grad_accumulator)):
-            self.grad_accumulator[i].assign_add(grads[i])
+        # None/NaN/Inf 방어
+        safe_grads = []
+        for g, v in zip(grads, vars_):
+            if g is None:
+                g = tf.zeros_like(v)
+            else:
+                g = tf.where(tf.math.is_finite(g), g, tf.zeros_like(v))
+            safe_grads.append(g)
+
+        # 누적기 초기화
+        if self.grad_accumulator is None:
+            self.grad_accumulator = [tf.Variable(tf.zeros_like(v), trainable=False) for v in vars_]
+
+        # 누적
+        for acc, g in zip(self.grad_accumulator, safe_grads):
+            acc.assign_add(g)
+    
 
         # 스텝 카운터 증가 및 가중치 업데이트
         self.step_counter.assign_add(1)
@@ -676,9 +689,9 @@ class DiffusionModel(tf.keras.Model):
 
         def apply_and_reset_gradients():
             """가중치를 업데이트하고 누적기를 리셋하는 함수"""
-            self.optimizer.apply_gradients(zip(self.grad_accumulator, self.network.trainable_weights))
-            for grad_var in self.grad_accumulator:
-                grad_var.assign(tf.zeros_like(grad_var))
+            self.optimizer.apply_gradients(zip(self.grad_accumulator, vars_))
+            for acc in self.grad_accumulator:
+                acc.assign(tf.zeros_like(acc))
             
             # EMA 업데이트 로직도 여기에 포함
             for w, ew in zip(self.network.weights, self.ema_network.weights):
@@ -790,71 +803,10 @@ class DiffusionModel(tf.keras.Model):
             next_t = t - 1.0 / steps
             next_nr, next_sr = self.diffusion_schedule(next_t)
             next_x = next_sr * px0 + next_nr * pn
+            
         return px0  # 최종 예측된 x0 반환
     
-
-    # def plot_images(self, epoch=None, logs=None, val_ds=None, ihaze_ds=None, num_rows=3, num_cols=6, save_dir= "/home/jang/DDIM_python/paper/samples"): #이 변수로 개수 조절
-    #     # plot random generated images for visual evaluation of generation quality
-    #     # 디렉토리 없으면 생성
-        
-    #     gc.collect()
-        
-    #     os.makedirs(save_dir, exist_ok=True)
-    #     packs = []  # (tag, hazy_batch, dehazed_batch, clear_batch)
-    #     for hazy_b, clear_b, ctx_b in val_ds.take(1):
-    #         dehazed_b = self.dehaze(hazy_b, ctx_b)  # [-1,1] 범위
-    #         # if tf.executing_eagerly():
-    #         #     tf.print("before clip x0 min/max:", tf.reduce_min(dehazed_b), "/", tf.reduce_max(dehazed_b))    
-            
-    #         dehazed_b = tf.clip_by_value(dehazed_b, -1.0, 1.0)
-    #         # if tf.executing_eagerly():
-    #         #     tf.print("after clip x0 min/max:", tf.reduce_min(dehazed_b), "/", tf.reduce_max(dehazed_b))
-            
-    #         dehazed_b = self.denormalize(dehazed_b)  #[0,1] 범위
-    #         # if tf.executing_eagerly():
-    #         #     tf.print("x0 min/max:", tf.reduce_min(dehazed_b), "/", tf.reduce_max(dehazed_b))
-    #         #     tf.print("x0 mean/std:", tf.reduce_mean(dehazed_b), "/", tf.math.reduce_std(dehazed_b))  
-    #         packs.append(("RESIDE", hazy_b, dehazed_b, clear_b)) 
-    #         break 
-            
-            
-        
-    #     if ihaze_ds is not None:
-    #         for hazy_i, clear_i, ctx_i in ihaze_ds.take(1):
-    #             dehazed_i = self.dehaze(hazy_i, ctx_i)
-                
-    #             dehazed_i = tf.clip_by_value(dehazed_i, -1.0, 1.0)
-                
-    #             dehazed_i = self.denormalize(dehazed_i)
-                
-    #             packs.append(("I-HAZE", hazy_i, dehazed_i, clear_i))
-    #             break
-
-            
-    #     batch_size = sum(int(p[1].shape[0]) for p in packs)
-    #     fig, axs = plt.subplots(batch_size, 3, figsize=(12, 4 * batch_size))
-        
-    #     if batch_size == 1:
-    #         axs = np.array([axs])
-            
-    #     r = 0
-        
-    #     for tag, hazy_batch, dehazed_batch, clear_batch in packs:
-    #         bs = int(hazy_batch.shape[0])
-    #         for i in range(bs):
-    #             axs[r, 0].imshow(hazy_batch[i]);    axs[r, 0].set_title(f"{tag} • Hazy");    axs[r, 0].axis("off")
-    #             axs[r, 1].imshow(dehazed_batch[i]); axs[r, 1].set_title(f"{tag} • Dehazed"); axs[r, 1].axis("off")
-    #             axs[r, 2].imshow(clear_batch[i]);   axs[r, 2].set_title(f"{tag} • Clear");   axs[r, 2].axis("off")
-    #             r += 1
-
-        
-    #     plt.tight_layout()
-    #     # epoch 번호 포맷팅 및 저장 경로 사용
-    #     epoch_str = f"{epoch:03d}" if isinstance(epoch, int) else str(epoch)
-    #     # 사진 저장
-    #     plt.savefig(os.path.join(save_dir, f"generated_epoch_{epoch_str}.png"), dpi=200)
-    #     plt.close(fig)
-
+    
     def plot_images(self, epoch, dataset, dataset_tag, save_dir = "/home/jang/DDIM_python/paper/samples"):
         """
         주어진 하나의 데이터셋에 대해 이미지를 생성하고 저장합니다.
@@ -903,169 +855,68 @@ class DiffusionModel(tf.keras.Model):
 
 
 
-# ─── 12) 모델 생성 & Build ───
+reside_output_dir = "/home/jang/DDIM_python/paper/samples_reside"
+ihaze_output_dir = "/home/jang/DDIM_python/paper/samples_ihaze"
+
+print(" 저장된 최적 가중치로 이미지 생성을 시작합니다.")
+
+# 1. 새로운 모델 인스턴스를 생성합니다.
 model = DiffusionModel(img_siz, widths, block_depth, ctx_dim)
-_ = model.mask_pred(tf.zeros((1,img_siz,img_siz,3)))
-_ = model.network([
-    tf.zeros((1,img_siz,img_siz,3)),
-    tf.zeros((1,img_siz,img_siz,3)),
-    tf.zeros((1,1,1,1)),
-    tf.zeros((1,seq_len,768)),
-    tf.zeros((1,img_siz,img_siz,1))
-])
 
-_ = model.ema_network([
-    tf.zeros((1,img_siz,img_siz,3)),
-    tf.zeros((1,img_siz,img_siz,3)),
-    tf.zeros((1,1,1,1)),
-    tf.zeros((1,seq_len,768)),
-    tf.zeros((1,img_siz,img_siz,1))
-], training=False)
-model.ema_network.set_weights(model.network.get_weights())
+input_shape = [
+    (batch_siz, img_siz, img_siz, 3), # noised
+    (batch_siz, img_siz, img_siz, 3), # hazy
+    (batch_siz, 1, 1, 1),             # gamma
+    (batch_siz, seq_len, 768),        # context (원본 768 차원)
+    (batch_siz, img_siz, img_siz, 1), # mask_in
+]
 
-# ─── 12.5) 모델 빌드(dummy call) ───
-dummy_hazy  = tf.zeros((1, img_siz, img_siz, 3), dtype=tf.float32)
-dummy_t     = tf.zeros((1, 1, 1, 1), dtype=tf.float32)
-dummy_ctx   = tf.zeros((1, seq_len, 768), dtype=tf.float32)
-dummy_mask  = tf.zeros((1, img_siz, img_siz, 1), dtype=tf.float32)
-
-_ = model([dummy_hazy, dummy_hazy, dummy_t, dummy_ctx, dummy_mask], training=False)
+print("모델을 빌드합니다...")
+model.build(input_shape=input_shape)
+print("모델 빌드 완료.")
 
 
-# #GT data set의 평균과 표준편차 확인---------------
-# mean_accum = tf.Variable(tf.zeros([3], dtype=tf.float32))
-# std_accum  = tf.Variable(tf.zeros([3], dtype=tf.float32))
-# n = 0
+checkpoint_files = sorted(glob.glob(os.path.join(checkpoint_dir, "epoch*.h5")))
+print(f"총 {len(checkpoint_files)}개의 에폭 체크포인트를 찾았습니다.")
+
+# 3. 모델을 컴파일합니다. (추론만 할 때는 간단하게 해도 됩니다)
+model.compile(optimizer=optimizers.Adam())
 
 
-# for _, gt, *_ in train_ds.take(6000):  # 🔁 두 번째 요소 = clear image
-#     #if tf.executing_eagerly():
-#        tf.print("GT min:", tf.reduce_min(gt), "max:", tf.reduce_max(gt))  # [0,1] 또는 [-1,1] 확인
-#     gt = tf.reshape(gt, [-1, 3])
-#     mean_accum.assign_add(tf.reduce_mean(gt, axis=0))
-#     std_accum.assign_add(tf.math.reduce_std(gt, axis=0))
-#     n += 1
-
-# if tf.executing_eagerly():
-#   tf.print("📊 GT mean:", mean_accum / n) # 📊 GT mean: [0.45907 0.434806436 0.421944499]
-#   tf.print("📊 GT std :", std_accum / n) #📊 GT std : [0.26653102 0.270138741 0.289018691]
-
-
-class AdamWithLR(optimizers.Adam):
-    """
-    최신 Keras API와의 호환성을 위해 .lr 속성을 추가한 Adam 옵티마이저.
-    오래된 콜백이 optimizer.lr을 호출할 때 optimizer.learning_rate 값을 반환해줍니다.
-    """
-    @property
-    def lr(self):
-        return self.learning_rate
+# 5. 각 체크포인트에 대해 반복 작업 수행
+for ckpt_path in checkpoint_files:
     
-# ─── 13) 학습 설정 & 실행 ───
-model.compile(
-    optimizer=AdamWithLR(5e-5)       # 학습률을 보통 1e-4를 사용. 1e-5는 안정성 확보할때 사용
-)
+    # 파일명에서 에폭 번호 추출 (예: 'epoch045-...' -> 45)
+    epoch_num_match = re.search(r"epoch(\d+)", os.path.basename(ckpt_path))
+    if not epoch_num_match:
+        continue # 'epoch' 패턴이 없는 파일은 건너뛰기
+    epoch_num = int(epoch_num_match.group(1))
+    
+    print(f"--- Epoch {epoch_num} 가중치로 이미지 생성 중... ---")
+    
+    # 해당 에폭의 가중치 로드
+    model.load_weights(ckpt_path)
+    
+    # 첫 번째 데이터셋(RESIDE)에 대한 이미지 생성
+    print(f"--- RESIDE 데이터셋 생성 중... ---")
+    model.plot_images(
+        epoch=epoch_num,
+        dataset=val_ds, # RESIDE 데이터셋 전달
+        dataset_tag="RESIDE",
+        save_dir=reside_output_dir
+    )
 
-
-print("전체 trainable weight 수:", len(model.network.trainable_variables))  # 72개 나옴
-for v in model.network.trainable_variables:
-    print("✅", v.name, v.shape)
+    # 두 번째 데이터셋(I-HAZE)에 대한 이미지 생성
+    print(f"--- I-HAZE 데이터셋 생성 중... ---")
+    if ihaze_ds is not None: # ihaze_ds가 있을 경우에만 실행
+        model.plot_images(
+            epoch=epoch_num,
+            dataset=ihaze_ds, # I-HAZE 데이터셋 전달
+            dataset_tag="I-HAZE",
+            save_dir=ihaze_output_dir
+        )
     
     
-model.run_eagerly = False   # 디버깅할때는 True로 바꾸자
+print(f" 모든 이미지 생성이 완료되었습니다.")
 
-# 파이썬의 if문은 tf.equal()과 같은 결과가 나중에 계싼될 예정인 텐서를 반환하는 것과 충돌을 일으킴
-
-per_epoch_cb = keras.callbacks.ModelCheckpoint(
-    filepath=os.path.join(
-        checkpoint_dir,
-        "epoch{epoch:03d}-valNoise{val_noise_loss:.5f}.net.weights.h5"  # 로그값도 파일명에!
-    ),
-    save_weights_only=True,
-    save_freq='epoch',
-    save_best_only=False,   # ← 매 에폭 저장
-    verbose=0,
-)
-
-best_cb = keras.callbacks.ModelCheckpoint(    # 베스트만 저장
-    filepath=os.path.join(checkpoint_dir, "best.weights.h5"),
-    save_weights_only=True,
-    monitor="val_noise_loss",   # 어떤 지표가 좋아졌을때 저장할지 -> 베스트 모델만 저장하려고 이렇게 함
-    mode="min",#최소기준
-    save_best_only=True,
-    verbose=1
-)
-
-
-last_cb = keras.callbacks.ModelCheckpoint(  # 매 에폭의 마지막 가중치 저장
-    filepath=os.path.join(checkpoint_dir, "last.weights.h5"),
-    save_weights_only=True,
-    save_freq="epoch",
-    verbose=0,
-)
-
-for v in model.trainable_variables:
-    if "hf_cross_attn" in v.name:
-        print(f"✅ 학습 대상: {v.name}")
-        
-
-print("steps_per_epoch : ", steps_per_epoch)
-print("fit 이전")
-
-# checkpoint_path = "/home/jang/DDIM_python/paper/checkpoints_weights/epoch009-valNoise0.27245.net.weights.h5"   # 가중치 불러오기
-# # 모델에 가중치 로드
-# model.load_weights(checkpoint_path)
-
-# 알아서 학습률 조정해줌
-lr_scheduler = tf.keras.callbacks.ReduceLROnPlateau(
-    monitor='val_noise_loss', # 이 지표의 개선을 관찰
-    factor=0.2,             # 개선이 없을 경우, 현재 학습률에 0.2를 곱함 (예: 5e-6 -> 1e-6).
-    patience=5,             # 5 에폭 동안 monitor 지표가 개선되지 않으면 학습률을 줄입니다.
-    min_lr=1e-7,            # 학습률이 이 값 밑으로 떨어지지 않도록 하한선을 설정합니다.
-    verbose=1               # 콜백이 실행될 때 로그를 출력합니다.
-)
-
-
-history = model.fit(
-    train_ds,
-    validation_data=val_ds,
-    epochs=num_epochs,
-    # initial_epoch=9,            # 시작할 에폭 번호
-    steps_per_epoch=steps_per_epoch,   #한 epoch 당 배치 개수
-    validation_steps=val_steps,
-    verbose = 1,
-    callbacks=[
-        per_epoch_cb,
-        best_cb,
-        last_cb,
-        # keras.callbacks.LambdaCallback(
-        #     on_epoch_end=lambda epoch, 
-        #     logs: model.plot_images(epoch, logs, val_ds=val_ds, ihaze_ds=ihaze_ds)
-        # ),#이미지 생성
-        # EpochTracker(),
-        lr_scheduler
-    ]
     
-)
-
-
-# 시각화
-plt.figure(figsize=(12, 6))
-
-# 기록된 메트릭 시각화
-for key in history.history:
-    if key in ['noise_loss', 'image_loss', 'psnr', 'ssim',
-               'val_noise_loss', 'val_image_loss', 'val_psnr', 'val_ssim']:
-        plt.plot(history.history[key], label=key)
-
-plt.xlabel("Epochs")
-plt.ylabel("Metric")
-plt.title("Training & Validation Metrics")
-plt.legend()
-plt.grid(True)
-plt.tight_layout()
-
-# 저장
-os.makedirs("plots", exist_ok=True)
-plt.savefig("plots/loss_curve.png", dpi=150)
-plt.close()
-
