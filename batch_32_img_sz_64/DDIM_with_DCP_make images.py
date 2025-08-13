@@ -113,7 +113,7 @@ exts     = ('.png', '.jpg', '.jpeg')
 # if tf.executing_eagerly():
 #    tf.print(f"context 저장 완료 : {output_json}")
 
-json_path = "/home/jang/DDIM_python/paper/reside6k_contexts_blip.json"
+json_path = "/home/jang/DDIM_python/paper/reside6k_contexts_blip_train.json"
 with open(json_path, "r") as f:
   context_dict = json.load(f)
 
@@ -169,9 +169,9 @@ def encode_context(text_str: str) -> np.ndarray:
 #     np.save(os.path.join(context_embedding_dir, f"{filename}.npy"), context_np)
 # # 여기까지---------------------
     
-context_embedding_dir = '/home/jang/DDIM_python/paper/contexts_blip_embedding'
+context_embedding_dir = '/home/jang/DDIM_python/paper/contexts_blip_embedding_RESIDE-6K'
 
-context_embedding_dir_test = '/home/jang/DDIM_python/paper/contexts_blip_embedding_test'
+context_embedding_dir_test = '/home/jang/DDIM_python/paper/contexts_blip_embedding_test_RESIDE-6K'
     
 def _read_image(path):  
     img = tf.io.decode_image(tf.io.read_file(path), channels=3, expand_animations=False)
