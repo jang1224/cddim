@@ -48,8 +48,8 @@ for g in gpus:
 
 # ─── 3) 하이퍼파라미터 ───
 img_siz             = 128
-batch_siz           = 8
-gradient_accumulation_steps = 4
+batch_siz           = 16
+gradient_accumulation_steps = 2
 effective_batch_siz = batch_siz * gradient_accumulation_steps
 kid_diffusion_steps = 100    # ← must be before class definition
 min_signal_rate     = 1e-4 #0.02
@@ -60,7 +60,7 @@ widths              = [64, 128, 256, 256]    #[160,320,768,768] # 768인 이유�
 block_depth         = 2
 ctx_dim             = 256
 seq_len             = 77    # tokenizer max length
-num_epochs          = 200    # 학습 에폭
+num_epochs          = 300    # 학습 에폭
 groups              = 32    # groupNorm에서 몇 그룹으로 묶을건지
 
 # 모델 준비
