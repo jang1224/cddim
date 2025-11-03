@@ -8,11 +8,17 @@ val_steps_per_epoch : 50
 
 batch : 16
 
+group : 16
+
 image size : 128
 
 widths : [64,128,256,256]
 
 block_depth : 2
+
+learning rate : 1e-6
+
+weight_decay : 1e-5
 
 -------------------------------
 ### performance
