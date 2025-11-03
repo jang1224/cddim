@@ -1,0 +1,24 @@
+Data Set : RESIDE-b
+
+epoch : 110
+
+steps_per_epoch : 750
+
+val_steps_per_epoch : 50
+
+batch : 16
+
+image size : 128
+
+widths : [64,128,256,256]
+
+block_depth : 2
+
+-------------------------------
+### performance
+
+103 epoch을 돌린 결과 다음과 같은 평가결과가 나왔다.
+
+ssim : 0.9117
+
+psnr : 20.8113
