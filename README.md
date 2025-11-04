@@ -1,6 +1,6 @@
 Data Set : RESIDE-b
 
-epoch : 110
+epoch : 130
 
 steps_per_epoch : 750
 
@@ -23,8 +23,8 @@ weight_decay : 1e-5
 -------------------------------
 ### performance
 
-103 epoch을 돌린 결과 다음과 같은 평가결과가 나왔다.
+130 epoch을 돌린 결과 다음과 같은 평가결과가 나왔다.
 
-ssim : 0.9117
+ssim : 0.9404
 
-psnr : 20.8113
+psnr : 20.9621
